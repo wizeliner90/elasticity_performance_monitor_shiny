@@ -1,0 +1,750 @@
+import os
+import sys
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from streamlit.components.v1 import html as st_html
+
+# =====================
+# CONFIGURACIÓN Y ESTILO GLOBAL
+# =====================
+st.set_page_config(page_title="Elasticity Price Monitor", layout="wide")
+
+# ====== ESTILOS ======
+CSS = """
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+    [data-testid="stMetric"] { padding: 4px 8px !important; margin: 0 0 6px 0 !important; }
+    [data-testid="stMetricLabel"] { font-size: 14px !important; }
+    [data-testid="stMetricValue"] { font-size: 20px !important; line-height: 1.2 !important; }
+    html, body, [class*="css"] { font-family: 'Montserrat', sans-serif; }
+    div[data-testid="stDecoration"], div[data-testid="stStatusWidget"], div[data-testid="stToolbar"] { display: none !important; }
+    div[data-testid="stHeader"] { height: 0 !important; min-height: 0 !important; background: transparent !important; }
+    header { display: none !important; }
+    section.main > div:first-child { margin-top: 0 !important; padding-top: 0 !important; }
+    [data-testid="stPlotlyChart"] { margin-top: 20px !important; }
+    .block-container { padding-top: 0.2rem !important; }
+    .stTabs [data-baseweb="tab-list"] { gap: 12px; border-bottom: 2px solid #E9ECEF; margin: 0 0 4px 0 !important; }
+    .stTabs [role="tab"] { font-weight: 600; color: #4B4B4B; }
+    .stTabs [aria-selected="true"] { color: #E41E26 !important; border-bottom: 3px solid #E41E26 !important; }
+    .stDownloadButton button, .stButton button {
+        background-color: #E41E26 !important; color: #FFFFFF !important;
+        border-radius: 10px !important; border: 2px solid #E41E26 !important; font-weight: 700 !important;
+    }
+    .card-cc { background: #E41E26; color: #FFFFFF; border-radius: 12px; border: 2px solid #E41E26; box-shadow: 0 2px 8px rgba(0,0,0,.06); padding: 10px 12px; }
+    .card-cc h4 { margin: 0 0 6px 0; font-size: 14px; font-weight: 700; }
+    .card-cc ul { list-style: none; padding-left: 0; margin: 6px 0 0 0; }
+    .card-cc li { margin: 0 0 8px 0; line-height: 1.25; }
+    .pill-share { background: #FFFFFF; color: #E41E26; border-radius: 10px; padding: 2px 6px; font-size: 11px; font-weight: 700; }
+    .muted { color: rgba(255,255,255,.9); font-size: 12px; }
+</style>
+"""
+st_html(CSS, height=0)
+
+# ===== COCA-COLA THEME (Plotly) =====
+COCA_RED = "#E41E26"
+COCA_RED_ALT = "#FF4B57"
+COCA_BLACK = "#000000"
+COCA_GRAY_DARK = "#4B4B4B"
+COCA_GRAY_LIGHT = "#E9ECEF"
+COCA_WHITE = "#FFFFFF"
+
+px.defaults.template = "simple_white"
+px.defaults.color_discrete_sequence = [
+    COCA_RED, "#1F1F1F", "#666666", COCA_RED_ALT, "#2E2E2E",
+    "#8C8C8C", "#B3B3B3", "#D9D9D9"
+]
+
+def kpi_card(label, value, variant="primary", size="compact"):
+    if variant == "primary":
+        bg, fg, border = COCA_RED, COCA_WHITE, COCA_RED
+    else:
+        bg, fg, border = COCA_WHITE, COCA_BLACK, COCA_RED
+
+    if size == "compact":
+        pad = "10px 12px"; fs_label = "11px"; fs_value = "22px"; radius = "12px"
+    else:
+        pad = "16px 18px"; fs_label = "12px"; fs_value = "32px"; radius = "16px"
+
+    html = f"""
+    <div style="background:{bg};color:{fg};padding:{pad};border-radius:{radius};
+                border:2px solid {border};box-shadow:0 2px 8px rgba(0,0,0,.06);height:100%;">
+        <div style="font-size:{fs_label}; letter-spacing:.4px; opacity:.9; margin-bottom:4px;">{label}</div>
+        <div style="font-size:{fs_value}; font-weight:700; line-height:1">{value}</div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+def fmt_int(n):
+    try:
+        return f"{int(round(n)):,}"
+    except Exception:
+        return "-"
+
+# =====================
+# FUENTES DE DATOS (solo Databricks SQL)
+# =====================
+
+# SCHEMA + tablas
+TBL_SERIES = "dev_co_price_mt.prediction_input_series"
+TBL_ELAST  = "dev_co_price_mt.final_pe_mt"
+TBL_CONS   = "dev_co_price_mt.mt_consolidated_pe"
+
+YEARS_TRAIN = (2021, 2023)
+YEARS_VAL   = (2024, 2025)
+eps = 1e-9
+
+# =====================
+# CONECTOR DATABRICKS SQL (sin CSV fallback)
+# =====================
+@st.cache_resource(show_spinner=False)
+def get_dbx_conn():
+    """
+    Conecta a Databricks SQL usando variables de entorno:
+      - DATABRICKS_HOST
+      - DATABRICKS_SQL_HTTP_PATH
+      - DATABRICKS_TOKEN
+    """
+    try:
+        from databricks import sql as dbsql
+    except Exception:
+        st.error("No se encontró la librería 'databricks-sql-connector'. Agrega 'databricks-sql-connector' a tus dependencias.")
+        st.stop()
+
+    token     = os.getenv("DATABRICKS_TOKEN")
+    http_path = os.getenv("DATABRICKS_SQL_HTTP_PATH")
+    host      = os.getenv("DATABRICKS_HOST")
+
+    if not token or not http_path or not host:
+        st.error(
+            "Variables de entorno faltantes para Databricks.\n"
+            "Revisa DATABRICKS_HOST, DATABRICKS_SQL_HTTP_PATH y DATABRICKS_TOKEN en tu app.yaml."
+        )
+        st.stop()
+
+    try:
+        conn = dbsql.connect(server_hostname=host, http_path=http_path, access_token=token)
+        return conn
+    except Exception as e:
+        st.error(f"No se pudo conectar a Databricks SQL: {e}")
+        st.stop()
+
+def _rows_to_df(cursor):
+    cols = [c[0] for c in cursor.description]
+    rows = cursor.fetchall()
+    return pd.DataFrame.from_records(rows, columns=cols)
+
+@st.cache_data(show_spinner=True)
+def run_query(query: str) -> pd.DataFrame:
+    conn = get_dbx_conn()
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return _rows_to_df(cur)
+
+# =====================
+# DATA LOADERS (solo tablas)
+# =====================
+@st.cache_data(show_spinner=True)
+def load_series():
+    df_series = run_query(f"SELECT * FROM {TBL_SERIES}")
+
+    # --- Normalización de PERIOD ---
+    def pick_col(df, opciones):
+        for c in opciones:
+            if c in df.columns:
+                return df[c]
+        return pd.Series([np.nan]*len(df), index=df.index)
+
+    if "PERIOD" in df_series.columns:
+        s = df_series["PERIOD"].astype(str).str.strip()
+        periods = pd.to_datetime(s, format="%Y_%m", errors="coerce")
+        if periods.isna().any():
+            m1 = s.str.match(r"^\d{4}-\d{1,2}$")
+            periods.loc[m1] = pd.to_datetime(s[m1] + "-01", errors="coerce")
+            m2 = s.str.match(r"^\d{6}$")
+            periods.loc[m2] = pd.to_datetime(s[m2], format="%Y%m", errors="coerce")
+            m3 = s.str.match(r"^\d{8}$")
+            periods.loc[m3] = pd.to_datetime(s[m3], format="%Y%m%d", errors="coerce")
+        df_series["PERIOD"] = periods
+    else:
+        y = pick_col(df_series,["YEAR", "year"])
+        m = pick_col(df_series,["MONTH", "month"])
+        y_str = y.astype("Int64").astype(str).str.zfill(4)
+        m_str = m.astype("Int64").astype(str).str.zfill(2)
+        df_series["PERIOD"] = pd.to_datetime(y_str + "-" + m_str + "-01", errors="coerce")
+
+    # --- Normalizaciones de nombres ---
+    rename_map = {}
+    if "CATEGORY_REVISED"      in df_series.columns: rename_map["CATEGORY_REVISED"] = "CATEGORIA"
+    if "SUBCATEGORY_REVISED"   in df_series.columns: rename_map["SUBCATEGORY_REVISED"] = "SUBCATEGORIA"
+    if "SKU_GROUP"             in df_series.columns: rename_map["SKU_GROUP"] = "SKU"
+    if "UC_CALCULATED"         in df_series.columns: rename_map["UC_CALCULATED"] = "UC"
+    if "INGRESO_NETO" in df_series.columns or "INGRES_NETO" in df_series.columns:
+        rename_map["INGRESO_NETO" if "INGRESO_NETO" in df_series.columns else "INGRES_NETO"] = "INGRESO"
+    if "PRICE"                 in df_series.columns: rename_map["PRICE"] = "PRECIO"
+    if rename_map:
+        df_series = df_series.rename(columns=rename_map)
+
+    for need in ["PERIOD", "SKU"]:
+        if need not in df_series.columns:
+            raise KeyError(f"Falta la columna requerida: {need}")
+
+    for col in ["UC","INGRESO"]:
+        if col in df_series.columns:
+            df_series[col] = pd.to_numeric(df_series[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+
+    return df_series
+
+@st.cache_data(show_spinner=True)
+def load_joined_for_elasticity(df_base):
+    # final_pe_mt
+    pe = run_query(f"SELECT * FROM {TBL_ELAST}")
+    pe = pe.rename(columns={
+        "SKU_NAME": "SKU",
+        "FINAL_PE": "FINAL_PE",
+        "PE_RANGE_CHECK_OVERALL": "PE_RANGE_CHECK_OVERALL",
+        "P1_MIN": "P1_MIN", "P1_MAX": "P1_MAX",
+        "P2_MIN": "P2_MIN", "P2_MAX": "P2_MAX",
+        "FINAL_PE_SOURCE": "FINAL_PE_SOURCE",
+    })
+
+    # LEFT JOIN por SKU
+    dj = df_base.merge(pe, on="SKU", how="left").sort_values(["SKU", "PERIOD"]).copy()
+
+    # mt_consolidated_pe
+    mt_pe = run_query(f"SELECT * FROM {TBL_CONS}")
+
+    # Merge por PPG si existe, si no por SKU (siempre LEFT)
+    right_key = "PPG" if "PPG" in mt_pe.columns else "SKU"
+    dj = dj.merge(mt_pe, how="left", left_on="SKU", right_on=right_key)
+
+    # Sustituir FINAL_PE por NET_PE si existe
+    if "NET_PE" in dj.columns:
+        dj["FINAL_PE"] = pd.to_numeric(dj["NET_PE"], errors="coerce")
+
+    price_col = next((c for c in ["PRECIO", "PRICE"] if c in dj.columns), None)
+    uc_col    = "UC" if "UC" in dj.columns else None
+    missing = []
+    if price_col is None: missing.append("PRECIO/PRICE")
+    if uc_col is None:    missing.append("UC")
+    if missing:
+        raise KeyError(f"Faltan columnas requeridas: {', '.join(missing)}")
+
+    dj[price_col] = pd.to_numeric(dj[price_col], errors="coerce")
+    dj[uc_col]    = pd.to_numeric(dj[uc_col],    errors="coerce")
+
+    dj["lag_price"] = dj.groupby("SKU")[price_col].shift(1)
+    dj["lag_uc"]    = dj.groupby("SKU")[uc_col].shift(1)
+
+    dj["dln_precio"] = np.nan
+    ok_p = (dj[price_col] > 0) & (dj["lag_price"] > 0)
+    dj.loc[ok_p, "dln_precio"] = np.log(dj.loc[ok_p, price_col]) - np.log(dj.loc[ok_p, "lag_price"])
+
+    dj["dln_uc"] = np.nan
+    ok_u = (dj[uc_col] > 0) & (dj["lag_uc"] > 0)
+    dj.loc[ok_u, "dln_uc"] = np.log(dj.loc[ok_u, uc_col]) - np.log(dj.loc[ok_u, "lag_uc"])
+
+    dj["impacto_esperado"] = dj["FINAL_PE"] * dj["dln_precio"]
+
+    return dj
+
+# =====================
+# MÉTRICAS DE ERROR
+# =====================
+def mape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
+    mask = (~np.isnan(y_true)) & (~np.isnan(y_pred)) & (np.abs(y_true) > eps)
+    if mask.sum()==0: return np.nan
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / (y_true[mask] + eps))) * 100
+
+def smape(y_true, y_pred, eps=1e-8):
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
+    mask = (~np.isnan(y_true)) & (~np.isnan(y_pred))
+    if mask.sum()==0: return np.nan
+    num = np.abs(y_true[mask]-y_pred[mask])
+    den = (np.abs(y_true[mask]) + np.abs(y_pred[mask]) + eps)
+    return np.mean(2*num/den) * 100
+
+def diracc(y_true, y_pred):
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
+    mask = (~np.isnan(y_true)) & (~np.isnan(y_pred))
+    if mask.sum()==0: return np.nan
+    return (np.sign(y_true[mask])==np.sign(y_pred[mask])).mean() * 100
+
+# =====================
+# CLIPPING DE RANGOS
+# =====================
+def apply_ranges_block(dd, apply_to="Esperado"):
+    d = dd.copy()
+    for c in ["P1_MIN","P1_MAX","P2_MIN","P2_MAX","PE_RANGE_CHECK_OVERALL"]:
+        if c in d.columns: d[c] = pd.to_numeric(d[c], errors="coerce")
+    cond1 = (d["PE_RANGE_CHECK_OVERALL"] == 1)
+    cond2 = (d["PE_RANGE_CHECK_OVERALL"] == 2)
+    e_min = np.where(cond1, d["P1_MIN"], np.where(cond2, d["P2_MIN"], np.nan))
+    e_max = np.where(cond1, d["P1_MAX"], np.where(cond2, d["P2_MAX"], np.nan))
+
+    e_teor = d["dln_uc"] / d["dln_precio"]
+    e_teor = pd.to_numeric(e_teor, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    eps_local = 1e-8
+    no_move = d["dln_precio"].abs() < eps_local
+
+    lower = np.where(np.isnan(e_min), -np.inf, e_min)
+    upper = np.where(np.isnan(e_max),  np.inf,  e_max)
+    e_used = np.clip(e_teor.to_numpy(), lower, upper)
+
+    d["real_clipped"] = e_used * d["dln_precio"].to_numpy()
+    d.loc[no_move, "real_clipped"] = 0.0
+
+    d["clip_source"] = np.nan
+    to_min = (e_teor.to_numpy() < lower) & ~no_move.to_numpy()
+    to_max = (e_teor.to_numpy() > upper) & ~no_move.to_numpy()
+    d.loc[to_min & cond1.to_numpy(), "clip_source"] = "P1_MIN"
+    d.loc[to_max & cond1.to_numpy(), "clip_source"] = "P1_MAX"
+    d.loc[to_min & cond2.to_numpy(), "clip_source"] = "P2_MIN"
+    d.loc[to_max & cond2.to_numpy(), "clip_source"] = "P2_MAX"
+    d.loc[no_move, "clip_source"] = "NO_PRICE_MOVE"
+    d["elasticidad_usada_real"] = e_used
+    return d
+
+# =====================
+# HELPERS PRECIO
+# =====================
+def detect_price_col(df_):
+    """Devuelve (colname, series_if_fallback). Si no hay PRECIO/PRICE y existen INGRESO & UC,
+       crea PRICE = INGRESO / UC (promedio) como fallback."""
+    if "PRECIO" in df_.columns: return "PRECIO", None
+    if "PRICE"  in df_.columns: return "PRICE",  None
+    if ("INGRESO" in df_.columns) and ("UC" in df_.columns):
+        s = np.where(
+            pd.to_numeric(df_["UC"], errors="coerce") > 0,
+            pd.to_numeric(df_["INGRESO"], errors="coerce") / pd.to_numeric(df_["UC"], errors="coerce"),
+            np.nan
+        )
+        return "__PRICE_FALLBACK__", pd.Series(s, index=df_.index)
+    return None, None
+
+# =====================
+# CARGA SERIES
+# =====================
+df = load_series()
+
+# =====================
+# SIDEBAR (FILTROS)
+# =====================
+st.sidebar.markdown(f"<h3 style='color:{COCA_BLACK}; margin-bottom:4px;'>Filtros</h3>", unsafe_allow_html=True)
+metric_mode = st.sidebar.radio(
+    "Métrica / Vista",
+    ("Volumen (UC)", "Ventas ($ Ingreso)", "Precio vs. UC (Δ%)"),
+    help="Selecciona qué ver en el panel principal."
+)
+metric_col = "UC" if metric_mode == "Volumen (UC)" else ("INGRESO" if metric_mode == "Ventas ($ Ingreso)" else "UC")
+
+if metric_col not in df.columns:
+    st.sidebar.warning(f"No encontré la columna '{metric_col}'. Intento usar otra disponible.")
+    metric_col = "UC" if "UC" in df.columns else ("INGRESO" if "INGRESO" in df.columns else None)
+if metric_col is None:
+    st.error("No hay columnas de métricas disponibles (UC/INGRESO).")
+    st.stop()
+
+cats = ["All"] + sorted(df.get("CATEGORIA", pd.Series(dtype=str)).dropna().unique().tolist())
+cat_sel = st.sidebar.selectbox("Categoría", cats)
+
+if cat_sel != "All" and "SUBCATEGORIA" in df.columns:
+    subs = ["All"] + sorted(df.loc[df["CATEGORIA"]==cat_sel,"SUBCATEGORIA"].dropna().unique().tolist())
+else:
+    subs = ["All"] + sorted(df.get("SUBCATEGORIA", pd.Series(dtype=str)).dropna().unique().tolist())
+sub_sel = st.sidebar.selectbox("Subcategoría", subs)
+
+if sub_sel != "All" and "SUBCATEGORIA" in df.columns:
+    skus_base = df.loc[df["SUBCATEGORIA"]==sub_sel,"SKU"]
+else:
+    skus_base = df["SKU"]
+skus = ['All'] + sorted(skus_base.dropna().unique().tolist())
+sku_sel = st.sidebar.selectbox("SKU", skus)
+
+# Fechas
+periods = pd.to_datetime(df["PERIOD"], errors="coerce")
+min_d, max_d = periods.min(), periods.max()
+if pd.isna(min_d) or pd.isna(max_d):
+    st.sidebar.warning("No hay fechas válidas en 'PERIOD'. Uso un rango por defecto.")
+    min_d = pd.Timestamp("2021-01-01")
+    max_d = pd.Timestamp.today().normalize()
+default_range = [min_d.date(), max_d.date()]
+dr = st.sidebar.date_input("Rango de Fechas", value=default_range, key="date_range")
+if isinstance(dr, (list, tuple)) and len(dr) == 2:
+    d_start, d_end = pd.Timestamp(dr[0]), pd.Timestamp(dr[1])
+else:
+    d_start = pd.Timestamp(dr); d_end = pd.Timestamp(dr)
+
+# Nivel inferido automáticamente a partir de los filtros
+def infer_level(cat_sel, sub_sel, sku_sel):
+    if sku_sel != "All":
+        return "SKU"
+    elif sub_sel != "All":
+        return "Subcategoría"
+    elif cat_sel != "All":
+        return "Categoría"
+    else:
+        return "Total"
+
+level = infer_level(cat_sel, sub_sel, sku_sel)
+
+# Top-N (solo cuando aplica)
+topn = None
+if level in ["Categoría", "Subcategoría", "SKU"]:
+    topn = st.sidebar.slider(
+        "Mostrar Top N (por volumen total)",
+        5, 30, 15,
+        help=f"Ordenado por {('UC' if metric_mode!='Ventas ($ Ingreso)' else 'Ingreso')} total en el rango seleccionado"
+    )
+
+# --- Altura de gráficas ---
+chart_h = st.sidebar.slider(
+    "Altura de gráficas (px)", 
+    min_value=280, max_value=600, value=380, step=10,
+    help="Ajusta la altura de todas las gráficas"
+)
+
+# =====================
+# TABS
+# =====================
+tab1, tab2 = st.tabs(["Sales Explorer", "Elasticity Performance"])
+
+# ===================== TAB 1: Sales Explorer =====================
+with tab1:
+    d = df.copy()
+    if cat_sel != "All" and "CATEGORIA" in d.columns:  d = d[d["CATEGORIA"] == cat_sel]
+    if sub_sel != "All" and "SUBCATEGORIA" in d.columns: d = d[d["SUBCATEGORIA"] == sub_sel]
+    if sku_sel != "All" and "SKU" in d.columns:          d = d[d["SKU"] == sku_sel]
+    d = d[(d["PERIOD"] >= d_start) & (d["PERIOD"] <= d_end)]
+
+    col1, col2, col3, col4 = st.columns([1,1,1,1])
+    base_col_for_kpi = "UC" if metric_mode == "Precio vs. UC (Δ%)" else metric_col
+    total_metric = pd.to_numeric(d[base_col_for_kpi], errors="coerce").sum(skipna=True)
+    skus_activos = d["SKU"].nunique()
+    meses = d["PERIOD"].dt.to_period("M").nunique() if len(d) else 0
+    prom_mensual = (total_metric/meses) if meses else np.nan
+    try:
+        this_year = d["PERIOD"].max().year; prev_year = this_year - 1
+        cur = pd.to_numeric(d[d["PERIOD"].dt.year == this_year][base_col_for_kpi], errors="coerce").sum()
+        prev = pd.to_numeric(d[d["PERIOD"].dt.year == prev_year][base_col_for_kpi], errors="coerce").sum()
+        yoy = ((cur - prev) / prev * 100) if prev and not np.isnan(prev) else np.nan
+    except Exception:
+        yoy = np.nan
+
+    metric_label_for_kpi = ("Volumen (UC)" if metric_mode=="Precio vs. UC (Δ%)" else metric_mode)
+    with col1: kpi_card(f"Total {metric_label_for_kpi}", fmt_int(total_metric), "primary", size="compact")
+    with col2: kpi_card("Volumen Promedio Mensual", fmt_int(prom_mensual), "secondary", size="compact")
+    with col3: kpi_card("SKU's Activos", fmt_int(skus_activos), "secondary", size="compact")
+    with col4: kpi_card("Crecimiento vs Año Ant.", f"{yoy:.1f}%" if not np.isnan(yoy) else "-", "secondary", size="compact")
+
+    st.markdown('<div class="vspace-12"></div>', unsafe_allow_html=True)
+
+    # ====== VISTA ESPECIAL: Precio vs. UC (Δ%) ======
+    if metric_mode == "Precio vs. UC (Δ%)":
+        pcol, fallback_series = detect_price_col(d)
+        if pcol is None:
+            st.warning("No encontré columna de precio ni puedo derivarla (INGRESO/UC).")
+            st.stop()
+        if pcol == "__PRICE_FALLBACK__":
+            d[pcol] = fallback_series
+
+        entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "SKU": "SKU"}
+        entity_col = entity_map[level]
+
+        if entity_col is None:
+            if "INGRESO" in d.columns and "UC" in d.columns:
+                dm = d.groupby(["PERIOD"], dropna=False).agg(
+                    UC=("UC", "sum"), INGRESO=("INGRESO","sum")
+                ).reset_index()
+                dm["PRICE_MEAN"] = np.where(dm["UC"]>0, dm["INGRESO"]/dm["UC"], np.nan)
+            else:
+                dm = d.groupby(["PERIOD"], dropna=False).agg(
+                    UC=("UC","sum") if "UC" in d.columns else ("SKU","count"),
+                    PRICE_MEAN=(pcol,"mean")
+                ).reset_index()
+
+            dm = dm.sort_values("PERIOD").copy()
+            dm["dln_price"] = np.log(dm["PRICE_MEAN"]).diff()
+            dm["dln_uc"]    = np.log(pd.to_numeric(dm["UC"], errors="coerce")).diff()
+            dm["Δ Precio (%)"] = np.expm1(dm["dln_price"]) * 100
+            dm["Δ UC (%)"]     = np.expm1(dm["dln_uc"]) * 100
+
+            plot_df = dm[["PERIOD","Δ Precio (%)","Δ UC (%)"]].melt(
+                id_vars="PERIOD", var_name="Serie", value_name="Valor"
+            )
+
+            fig = px.line(plot_df, x="PERIOD", y="Valor", color="Serie",
+                          title="Δ% Mensual: Precio vs. UC — Total")
+            fig.update_traces(mode="lines", line=dict(width=2),
+                              hovertemplate="%{x|%Y-%m}<br>%{fullData.name}: %{y:.1f}%")
+            fig.update_layout(
+                colorway=[COCA_RED, "#1F1F1F"],
+                title=dict(font=dict(color=COCA_BLACK, size=18), x=0.01),
+                hovermode="x unified", showlegend=True,
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor=COCA_GRAY_LIGHT, title="Δ% vs mes anterior"),
+                height=chart_h, margin=dict(l=10, r=10, t=30, b=10)
+            )
+            fig.add_hline(y=0, line_width=1, line_dash="dot")
+            st.plotly_chart(fig, use_container_width=True)
+
+            out = dm[["PERIOD","PRICE_MEAN","UC","Δ Precio (%)","Δ UC (%)"]].copy()
+            st.download_button("Descargar Δ Precio vs. Δ UC (Total)",
+                               out.to_csv(index=False).encode("utf-8"),
+                               file_name="delta_precio_vs_uc_total.csv", type="primary")
+
+        else:
+            if "INGRESO" in d.columns and "UC" in d.columns:
+                g = d.groupby(["PERIOD", entity_col], dropna=False).agg(
+                    UC=("UC","sum"), INGRESO=("INGRESO","sum")
+                ).reset_index()
+                g["PRICE_MEAN"] = np.where(g["UC"]>0, g["INGRESO"]/g["UC"], np.nan)
+            else:
+                g = d.groupby(["PERIOD", entity_col], dropna=False).agg(
+                    UC=("UC","sum") if "UC" in d.columns else ("SKU","count"),
+                    PRICE_MEAN=(pcol,"mean")
+                ).reset_index()
+
+            if topn is not None:
+                top_entities = (g.groupby(entity_col)["UC"].sum()
+                                  .sort_values(ascending=False).head(topn).index)
+                g = g[g[entity_col].isin(top_entities)]
+
+            g = g.sort_values([entity_col, "PERIOD"]).copy()
+            g["dln_price"] = g.groupby(entity_col)["PRICE_MEAN"].apply(lambda s: np.log(s).diff())
+            g["dln_uc"]    = g.groupby(entity_col)["UC"].apply(lambda s: np.log(pd.to_numeric(s, errors="coerce")).diff())
+            g["Δ Precio (%)"] = np.expm1(g["dln_price"]) * 100
+            g["Δ UC (%)"]     = np.expm1(g["dln_uc"]) * 100
+
+            plot_df = g.melt(
+                id_vars=["PERIOD", entity_col],
+                value_vars=["Δ Precio (%)","Δ UC (%)"],
+                var_name="Serie", value_name="Valor"
+            )
+
+            fig = px.line(
+                plot_df, x="PERIOD", y="Valor",
+                color=entity_col, line_dash="Serie",
+                title=f"Δ% Mensual: Precio vs. UC — {level}"
+            )
+            dash_map = {"Δ UC (%)": "solid", "Δ Precio (%)": "dash"}
+            fig.for_each_trace(lambda tr: tr.update(
+                line=dict(width=2, dash=dash_map.get(tr.name.split(", ")[-1], "solid"))
+            ))
+
+            fig.update_traces(hovertemplate="%{x|%Y-%m}<br>%{legendgroup}: %{y:.1f}% (%{line.dash})")
+            fig.update_layout(
+                title=dict(font=dict(color=COCA_BLACK, size=18), x=0.01),
+                hovermode="x unified", showlegend=True,
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor=COCA_GRAY_LIGHT, title="Δ% vs mes anterior"),
+                height=chart_h, margin=dict(l=10, r=10, t=30, b=10)
+            )
+            fig.add_hline(y=0, line_width=1, line_dash="dot")
+            st.plotly_chart(fig, use_container_width=True)
+
+            out_cols = ["PERIOD", entity_col, "PRICE_MEAN", "UC", "Δ Precio (%)", "Δ UC (%)"]
+            st.download_button(
+                f"Descargar Δ Precio vs. Δ UC ({level})",
+                g[out_cols].to_csv(index=False).encode("utf-8"),
+                file_name=f"delta_precio_vs_uc_{level.lower()}.csv",
+                type="primary"
+            )
+
+    else:
+        group = ["PERIOD"]; entity_col = None
+        if level=="Categoría" and "CATEGORIA" in d.columns:
+            group.append("CATEGORIA"); entity_col = "CATEGORIA"
+        elif level=="Subcategoría" and "SUBCATEGORIA" in d.columns:
+            group.append("SUBCATEGORIA"); entity_col = "SUBCATEGORIA"
+        elif level=="SKU" and "SKU" in d.columns:
+            group.append("SKU"); entity_col = "SKU"
+
+        agg = d.groupby(group, dropna=False)[metric_col].sum().reset_index()
+        left, right = st.columns([4, 1.35])
+
+        with left:
+            if entity_col and (topn is not None) and (entity_col in agg.columns):
+                tops_for_plot = (agg.groupby(entity_col)[metric_col].sum()
+                                    .sort_values(ascending=False)
+                                    .head(topn).index)
+                agg_plot = agg[agg[entity_col].isin(tops_for_plot)].copy()
+            else:
+                agg_plot = agg
+
+            titulo_metric = "UC" if metric_col == "UC" else "Ingreso"
+            title = f"{level} Mensual {titulo_metric}"
+            fig = px.line(
+                agg_plot, x="PERIOD", y=metric_col,
+                color=(entity_col if (entity_col and entity_col in agg_plot.columns) else None),
+                title=title
+            )
+            fig.update_traces(mode="lines", line=dict(width=2),
+                              hovertemplate="<b>%{fullData.name}</b><br>%{x|%Y-%m}: %{y:,}")
+            fig.update_layout(
+                title=dict(font=dict(color=COCA_BLACK, size=18), x=0.01),
+                hovermode="x unified", showlegend=False,
+                xaxis=dict(showgrid=False),
+                yaxis=dict(showgrid=True, gridcolor=COCA_GRAY_LIGHT),
+                height=chart_h, margin=dict(l=10, r=10, t=20, b=10)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            csv = agg.to_csv(index=False).encode("utf-8")
+            st.download_button("Descargar CSV", csv, file_name=f"{level}_{metric_col}.csv", type="primary")
+
+        with right:
+            if entity_col and (topn is not None) and (entity_col in d.columns):
+                etiqueta = "SKUs" if level == "SKU" else level
+                st.markdown(f"<div style='font-weight:700; color:{COCA_BLACK}; margin:4px 0 8px 0;'>Top {topn} {etiqueta}</div>", unsafe_allow_html=True)
+
+                total_sel = pd.to_numeric(d[metric_col], errors="coerce").sum()
+                top_df = (d.groupby(entity_col)[metric_col].sum()
+                          .sort_values(ascending=False).head(topn).reset_index())
+                top_df["__share"] = np.where(total_sel > 0,
+                                             (pd.to_numeric(top_df[metric_col], errors="coerce") / total_sel) * 100.0,
+                                             np.nan)
+
+                items = []
+                for i, row in top_df.iterrows():
+                    name = str(row[entity_col]); val = row[metric_col]; share = row["__share"]
+                    val_txt = f"{int(round(val)):,}" if pd.notna(val) else "-"
+                    share_txt = (f"{share:.1f}%" if pd.notna(share) else "-")
+                    items.append(
+                        f"<li style='margin-bottom:8px;'>"
+                        f"<span style='color:{COCA_RED}; font-weight:700;'>{i+1}.</span> {name}"
+                        f"<br><span style='color:{COCA_GRAY_DARK}; font-size:12px;'>Total: {val_txt} "
+                        f"| <span style='background:{COCA_RED}; color:#fff; border-radius:10px; padding:2px 6px; font-size:11px; font-weight:700;'>{share_txt}</span>"
+                        f"</span></li>"
+                    )
+                ul = "<ul style='list-style:none; padding-left:0; margin-top:4px;'>" + "\n".join(items) + "</ul>"
+                st.markdown(ul, unsafe_allow_html=True)
+            else:
+                st.write("")
+
+# ===================== TAB 2: Elasticity Performance =====================
+with tab2:
+    dj = load_joined_for_elasticity(df)
+
+    if cat_sel != "All" and "CATEGORIA" in dj.columns:
+        dj = dj[dj["CATEGORIA"] == cat_sel]
+    if sub_sel != "All" and "SUBCATEGORIA" in dj.columns:
+        dj = dj[dj["SUBCATEGORIA"] == sub_sel]
+
+    if not dj.empty:
+        dj = apply_ranges_block(dj)
+
+    chart_h_local = globals().get("chart_h", 460)
+
+    def build_total_series(df_):
+        uc_by_p        = df_.groupby("PERIOD", dropna=False)["UC"].sum(min_count=1).sort_index()
+        dln_uc_total   = np.log(pd.to_numeric(uc_by_p, errors="coerce")).diff()
+        exp_by_p       = df_.groupby("PERIOD", dropna=False)["impacto_esperado"].sum(min_count=1).sort_index()
+        real_clip_by_p = df_.groupby("PERIOD", dropna=False)["real_clipped"].sum(min_count=1).sort_index()
+
+        out = pd.DataFrame({
+            "PERIOD": uc_by_p.index,
+            "UC_total": uc_by_p.values,
+            "dln_uc_total": dln_uc_total.values,
+            "exp_total": exp_by_p.values,
+            "real_clip_total": real_clip_by_p.values
+        }).sort_values("PERIOD")
+        return out
+
+    vista = st.radio("Vista",
+                     ["Impacto Real vs. Impacto Esperado", "Impacto Real Ajustado vs. Impacto Esperado", "Comparar Ambos"],
+                     horizontal=True)
+
+    if level == "SKU":
+        sku_pick = sku_sel
+        if sku_pick == "All":
+            st.info("Selecciona un **SKU** en el sidebar para ver la elasticidad a nivel SKU.")
+        else:
+            dsku = dj[dj["SKU"] == sku_pick].sort_values("PERIOD").copy()
+            if dsku.empty:
+                st.warning("No hay datos para el SKU seleccionado con los filtros actuales.")
+            else:
+                real_raw_all = dsku["dln_uc"]
+                real_adj_all = dsku["real_clipped"]
+                exp_all      = dsku["impacto_esperado"]
+
+                real_for_kpi = real_raw_all if vista == "Impacto Real vs. Impacto Esperado" else real_adj_all
+
+                c1, c2, c3 = st.columns(3)
+                with c1: kpi_card("MAPE (↓ mejor)",  f"{mape(real_for_kpi, exp_all):.2f}%", "secondary", "compact")
+                with c2: kpi_card("SMAPE (↓ mejor)", f"{smape(real_for_kpi, exp_all):.2f}%", "secondary", "compact")
+                with c3: kpi_card("DIR (↑ mejor)",   f"{diracc(real_for_kpi, exp_all):.2f}%", "secondary", "compact")
+
+                fig = go.Figure()
+                main_series = real_raw_all if vista == "Impacto Real vs. Impacto Esperado" else real_adj_all
+                main_name   = "Impacto Real (%)" if vista == "Impacto Real vs. Impacto Esperado" else "Impacto Real Ajustado (%)"
+                fig.add_trace(go.Scatter(
+                    x=dsku["PERIOD"], y=np.expm1(main_series)*100,
+                    mode="lines", name=main_name, line=dict(width=2, color="#d62728")
+                ))
+                if vista == "Comparar Ambos":
+                    fig.add_trace(go.Scatter(
+                        x=dsku["PERIOD"], y=np.expm1(real_raw_all)*100,
+                        mode="lines", name="Impacto Real (%)", line=dict(width=2, dash='dot', color="#d62728")
+                    ))
+                fig.add_trace(go.Scatter(
+                    x=dsku["PERIOD"], y=np.expm1(exp_all)*100,
+                    mode="lines", name="Impacto Esperado (%)", line=dict(width=2, dash='dash', color="#000000")
+                ))
+                fig.update_layout(
+                    hovermode="x unified",
+                    xaxis_title="Periodo",
+                    yaxis_title="Cambio (%)",
+                    height=chart_h_local,
+                    margin=dict(l=10, r=10, t=20, b=10)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        if dj.empty:
+            st.warning("No hay datos con los filtros actuales.")
+        else:
+            total_df = build_total_series(dj).sort_values("PERIOD").copy()
+
+            if vista == "Impacto Real vs. Impacto Esperado":
+                real_all = total_df["dln_uc_total"]; real_for_kpi = real_all
+            elif vista == "Impacto Real Ajustado vs. Impacto Esperado":
+                real_all = total_df["real_clip_total"]; real_for_kpi = real_all
+            else:
+                real_all = total_df["real_clip_total"]; real_for_kpi = real_all
+
+            exp_all = total_df["exp_total"]
+
+            c1, c2, c3 = st.columns(3)
+            with c1: kpi_card("MAPE (↓ mejor)",  f"{mape(real_for_kpi, exp_all):.2f}%", "secondary", "compact")
+            with c2: kpi_card("SMAPE (↓ mejor)", f"{smape(real_for_kpi, exp_all):.2f}%", "secondary", "compact")
+            with c3: kpi_card("DIR (↑ mejor)",   f"{diracc(real_for_kpi, exp_all):.2f}%", "secondary", "compact")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=total_df["PERIOD"], y=np.expm1(real_all)*100,
+                mode="lines",
+                name=("Impacto Real (%)" if vista=="Impacto Real vs. Impacto Esperado" else "Impacto Real Ajustado (%)"),
+                line=dict(width=2, color="#d62728")
+            ))
+            if vista == "Comparar Ambos":
+                fig.add_trace(go.Scatter(
+                    x=total_df["PERIOD"], y=np.expm1(total_df["dln_uc_total"])*100,
+                    mode="lines", name="Impacto Real (%)", line=dict(width=2, dash='dot', color="#d62728")
+                ))
+            fig.add_trace(go.Scatter(
+                x=total_df["PERIOD"], y=np.expm1(exp_all)*100,
+                mode="lines", name="Impacto Esperado (%)", line=dict(width=2, dash='dash', color="#000000")
+            ))
+            fig.update_layout(
+                hovermode="x unified",
+                xaxis_title="Periodo",
+                yaxis_title="Cambio (%)",
+                height=chart_h_local,
+                margin=dict(l=10, r=10, t=20, b=10)
+            )
+            st.plotly_chart(fig, use_container_width=True)
