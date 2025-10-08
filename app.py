@@ -7,7 +7,6 @@ import plotly.graph_objects as go
 from datetime import datetime
 from plotly.subplots import make_subplots
 
-
 from shiny import App, ui, reactive, render
 from shinywidgets import output_widget, render_widget
 
@@ -478,62 +477,23 @@ app_ui = ui.page_fluid(
         ),
 
         ui.navset_tab(
+            # ---- NUEVA pestaña unificada: Sensibilidad de Precio y Volumen
             ui.nav_panel(
-                ui.tags.span("Elasticidad vs", ui.br(), "VTM"),
+                ui.tags.span("Sensibilidad de", ui.br(), "Precio y Volumen"),
                 ui.div(
                     ui.row(
-                        ui.column(12, output_widget("fig_ev_correlation_timeline")),
+                        ui.column(3, ui.output_ui("kpi_sens_ppg")),
+                        ui.column(3, ui.output_ui("kpi_sens_vtm")),
+                        ui.column(3, ui.output_ui("kpi_sens_net")),
+                        ui.column(3, ui.output_ui("kpi_sens_dir")),
                     ),
                     style="margin-top:16px; margin-bottom:10px;"
                 ),
-                ui.div(
-                    ui.row(
-                        ui.column(6,  output_widget("fig_ev_scatter_vtm_gap")),
-                        ui.column(6,  output_widget("fig_ev_stack_flows")),
-                    ),
-                    style="margin-bottom:10px;"
-                ),
-                ui.download_button("dl_ev_monthly_flows", "Descargar (flows mensuales) CSV")
+                ui.output_data_frame("tabla_sensibilidad"),
+                ui.download_button("dl_sensibilidad", "Descargar análisis (CSV)")
             ),
 
-            # ---- NUEVA pestaña 1
-            ui.nav_panel(
-                ui.tags.span("Elasticidad &", ui.br(), "VTM Insights"),
-                # FILA 1: PPG_PE
-                ui.div(
-                    ui.row(
-                        ui.column(3, ui.output_ui("kpi_ppg_cat")),
-                        ui.column(3, ui.output_ui("kpi_ppg_sub")),
-                        ui.column(3, ui.output_ui("kpi_ppg_marca")),
-                        ui.column(3, ui.output_ui("kpi_ppg_sku")),
-                    ),
-                    style="margin-top:16px; margin-bottom:10px;"
-                ),
-                # FILA 2: VTM_RATIO
-                ui.div(
-                    ui.row(
-                        ui.column(3, ui.output_ui("kpi_vtm_cat")),
-                        ui.column(3, ui.output_ui("kpi_vtm_sub")),
-                        ui.column(3, ui.output_ui("kpi_vtm_marca")),
-                        ui.column(3, ui.output_ui("kpi_vtm_sku")),
-                    ),
-                    style="margin-bottom:10px;"
-                ),
-                # FILA 3: NET_PE
-                ui.div(
-                    ui.row(
-                        ui.column(3, ui.output_ui("kpi_net_cat")),
-                        ui.column(3, ui.output_ui("kpi_net_sub")),
-                        ui.column(3, ui.output_ui("kpi_net_marca")),
-                        ui.column(3, ui.output_ui("kpi_net_sku")),
-                    ),
-                    style="margin-bottom:10px;"
-                ),
-                output_widget("fig_transfer_sankey"),
-                output_widget("fig_transfer_topdest"),
-                ui.download_button("dl_vtm", "Descargar métricas (CSV)")
-            ),
-            # ---- Línea de tiempo (modificada)
+            # ---- Línea de tiempo
             ui.nav_panel(
                 ui.tags.span("Línea de tiempo", ui.br(), "de Elasticidad"),
                 ui.div(
@@ -580,9 +540,11 @@ app_ui = ui.page_fluid(
 # =====================
 # SERVER
 # =====================
-def infer_level(cat_sel, sub_sel, sku_sel):
+def infer_level(cat_sel, sub_sel, marca_sel, sku_sel):
     if sku_sel != "All":
         return "SKU"
+    elif marca_sel != "All":
+        return "Marca"
     elif sub_sel != "All":
         return "Subcategoría"
     elif cat_sel != "All":
@@ -688,7 +650,7 @@ def server(input, output, session):
 
     @reactive.Calc
     def level_sel():
-        return infer_level(input.cat_sel() or "All", input.sub_sel() or "All", input.sku_sel() or "All")
+        return infer_level(input.cat_sel() or "All", input.sub_sel() or "All", input.marca_sel() or "All", input.sku_sel() or "All")
     
     def _flows_mask_for_filters(flows: pd.DataFrame, f: dict) -> pd.Series:
         m = pd.Series(True, index=flows.index)
@@ -702,7 +664,6 @@ def server(input, output, session):
         if brand_key != "ALL": m &= (flows["SRC_BRAND_KEY"]== brand_key)
         if sku_key != "ALL":   m &= (_norm_series(flows["SRC_SKU"]) == sku_key)
         return m
-
 
     # -------- VTM context (último año)
     @reactive.Calc
@@ -730,7 +691,6 @@ def server(input, output, session):
                 j[col + "_KEY"] = _norm_series(j[col])
         return {"last": d_last, "weights": w, "joined": j}
 
-
     def _wavg(df, col):
         v = pd.to_numeric(df[col], errors="coerce")
         w = pd.to_numeric(df["W_CU"], errors="coerce").clip(lower=0)
@@ -738,18 +698,6 @@ def server(input, output, session):
         if not m.any() or w[m].sum() == 0:
             return np.nan
         return float(np.average(v[m], weights=w[m]))
-    
-    # def _wavg_by_level(df, metric, level_col):
-    #     """Promedio ponderado por CU sobre el filtro actual, mostrando etiqueta por nivel."""
-    #     if df.empty or metric not in df.columns:
-    #         return np.nan
-    #     v = pd.to_numeric(df[metric], errors="coerce")
-    #     w = pd.to_numeric(df.get("W_CU"), errors="coerce")
-    #     m = v.notna() & w.notna() & (w > 0)
-    #     if not m.any():
-    #         return np.nan
-    #     # Ponderado sobre todas las filas; el nivel solo es para el label/orden visual
-    #     return float(np.average(v[m], weights=w[m]))
 
     def _effective_dims(j: pd.DataFrame, f: dict) -> dict:
         # lee selección actual y, si hay SKU, infiere cat/sub/marca reales desde j
@@ -766,518 +714,206 @@ def server(input, output, session):
             "marca": _norm_val(dims["marca"] if dims["marca"] != "All" else ""),
             "sku": _norm_val(dims["sku"] if dims["sku"] != "All" else ""),
         }
-
-        # Si seleccionó SKU, inferimos claves desde la tabla mt (joined)
         if dims["sku"] != "All" and "SKU_KEY" in j.columns:
             row = j.loc[j["SKU_KEY"] == _norm_val(dims["sku"])].head(1)
             if len(row):
-                if "CATEGORIA_KEY" in row.columns:  dims_key["cat"]   = row["CATEGORIA_KEY"].iloc[0]
+                if "CATEGORIA_KEY" in row.columns:    dims_key["cat"]   = row["CATEGORIA_KEY"].iloc[0]
                 if "SUBCATEGORIA_KEY" in row.columns: dims_key["sub"]   = row["SUBCATEGORIA_KEY"].iloc[0]
-                if "MARCA_KEY" in row.columns:      dims_key["marca"] = row["MARCA_KEY"].iloc[0]
+                if "MARCA_KEY" in row.columns:        dims_key["marca"] = row["MARCA_KEY"].iloc[0]
                 dims_key["sku"] = row["SKU_KEY"].iloc[0]
         return dims_key
 
-    def _mask_level(j: pd.DataFrame, dims_key: dict, level: str) -> pd.Series:
+    def _mask_level(j: pd.DataFrame, dims_key: dict) -> pd.Series:
+        # Aplica todos los filtros activos (cat/sub/marca/sku) de forma acumulativa
         m = pd.Series(True, index=j.index)
-        if level in ("cat", "sub", "marca", "sku") and "CATEGORIA_KEY" in j.columns and dims_key["cat"] != "ALL":
-            m &= (j["CATEGORIA_KEY"] == dims_key["cat"])
-        if level in ("sub", "marca", "sku") and "SUBCATEGORIA_KEY" in j.columns and dims_key["sub"] != "ALL":
-            m &= (j["SUBCATEGORIA_KEY"] == dims_key["sub"])
-        if level in ("marca", "sku") and "MARCA_KEY" in j.columns and dims_key["marca"] != "ALL":
-            m &= (j["MARCA_KEY"] == dims_key["marca"])
-        if level == "sku" and "SKU_KEY" in j.columns and dims_key["sku"] != "ALL":
-            m &= (j["SKU_KEY"] == dims_key["sku"])
+        if "CATEGORIA_KEY" in j.columns and dims_key["cat"]   != "ALL": m &= (j["CATEGORIA_KEY"]   == dims_key["cat"])
+        if "SUBCATEGORIA_KEY" in j.columns and dims_key["sub"]!= "ALL": m &= (j["SUBCATEGORIA_KEY"]== dims_key["sub"])
+        if "MARCA_KEY" in j.columns and dims_key["marca"]     != "ALL": m &= (j["MARCA_KEY"]       == dims_key["marca"])
+        if "SKU_KEY" in j.columns and dims_key["sku"]         != "ALL": m &= (j["SKU_KEY"]         == dims_key["sku"])
         return m
 
-    def _wavg_metric_at_level(j: pd.DataFrame, metric: str, f: dict, level_code: str):
+    def _wavg_metric_at_level(j: pd.DataFrame, metric: str, f: dict):
         if j.empty or metric not in j.columns:
             return np.nan
         dims_key = _effective_dims(j, f)
-        sel = _mask_level(j, dims_key, level_code)
+        sel = _mask_level(j, dims_key)
         vv = pd.to_numeric(j.loc[sel, metric], errors="coerce")
         ww = pd.to_numeric(j.loc[sel, "W_CU"], errors="coerce").clip(lower=0)
         mask = vv.notna() & ww.notna() & (ww > 0)
         if not mask.any():
             return np.nan
         return float(np.average(vv[mask], weights=ww[mask]))
-    
+
+    # ================= NUEVA TAB: Sensibilidad dinámica por nivel =================
     @reactive.Calc
-    def transfer_ctx():
-        """Une mapping con nuestro universo (último año) y calcula transferencias ponderadas por CU."""
-        j = vtm_context()["joined"].copy()              # contiene SKU, CATEGORIA/SUBCATEGORIA/MARCA y W_CU
-        if j.empty: 
-            return {"flows": pd.DataFrame(), "universe": j}
-
-        m = df_vtm_map().copy()
-        if m.empty:
-            return {"flows": pd.DataFrame(), "universe": j}
-
-        # Unimos SOLO cuando la fuente es un SKU nuestro
-        left = (m.merge(j[["SKU","SKU_KEY","CATEGORIA_KEY","SUBCATEGORIA_KEY","MARCA_KEY","W_CU"]],
-                        left_on="SOURCE_SKU_KEY", right_on="SKU_KEY", how="inner",
-                        suffixes=("","")))
-        # Outbound a competencia (si quieres incluir canibalización interna, quita este filtro)
-        left = left[ left["IS_SRC_COCA"] & (~left["IS_DEST_COCA"]) ].copy()
-
-        # Transferencia esperada en CU (volumen * ratio)
-        left["TRANSFER_CU"] = pd.to_numeric(left["W_CU"], errors="coerce") * pd.to_numeric(left["VOLUME_TRANSFER"], errors="coerce")
-        left["TRANSFER_CU"] = left["TRANSFER_CU"].clip(lower=0)
-
-        # Llaves de dims de la FUENTE (nuestro SKU)
-        left.rename(columns={
-            "CATEGORIA_KEY":"SRC_CAT_KEY",
-            "SUBCATEGORIA_KEY":"SRC_SUB_KEY",
-            "MARCA_KEY":"SRC_BRAND_KEY",
-            "SKU":"SRC_SKU",
-        }, inplace=True)
-
-        return {"flows": left, "universe": j}
-    
-        # ========= Elasticidad vs VTM (cálculos auxiliares) =========
-
-    def _is_coca(x: pd.Series) -> pd.Series:
-        """Heurística robusta para detectar COCA COLA FABRICANTE en columnas de MFG."""
-        s = _norm_series(x.fillna(""))
-        return s.str.contains("COCA") & s.str.contains("FABRICANTE")
-
-    @reactive.Calc
-    def ev_monthly_flows():
+    def sensibilidad_nivel_tabla_df():
         """
-        Calcula flows mensuales (último año) distribuyendo VOLUME_TRANSFER por el CU mensual.
-        Retorna DF con columnas:
-        PERIOD_M, TYPE (Interna|Competencia), TRANSFER_CU, CU_TOTAL, EXT_SHARE
-        Respetando los filtros (cat/sub/marca/sku) aplicados sobre el SKU fuente.
+        Genera la tabla de sensibilidad jerárquica filtrada dinámicamente
+        según los selectores activos (Categoría → Subcategoría → Marca → SKU)
+        y ponderada por el volumen (W_CU).
         """
-        # 1) Universo último año y pesos / jerarquías
-        ctx = vtm_context()
-        d_last = ctx["last"].copy()          # CU mensual por SKU (último año)
-        j      = ctx["joined"].copy()        # MT consolidated + W_CU + claves
+        try:
+            ctx = vtm_context()
+            j = ctx["joined"].copy()
+            if j.empty:
+                return pd.DataFrame()
 
-        if d_last.empty or j.empty:
-            return pd.DataFrame(columns=["PERIOD_M","TYPE","TRANSFER_CU","CU_TOTAL","EXT_SHARE"])
+            # ----------------------------
+            #  Aplicar filtros jerárquicos
+            # ----------------------------
+            f = filters()
+            if f["cat"] != "All" and "CATEGORIA" in j.columns:
+                cat_clean = f["cat"].strip().upper()
+                j["CATEGORIA_NORM"] = j["CATEGORIA"].astype(str).str.strip().str.upper()
+                j = j[j["CATEGORIA_NORM"] == cat_clean]
+            if f["sub"] != "All" and "SUBCATEGORIA" in j.columns:
+                j = j[j["SUBCATEGORIA"] == f["sub"]]
+            if f["marca"] != "All" and "MARCA" in j.columns:
+                j = j[j["MARCA"] == f["marca"]]
+            if f["sku"] != "All" and "SKU" in j.columns:
+                j = j[j["SKU"] == f["sku"]]
 
-        # Periodo mensual
-        d_last["PERIOD_M"] = (
-            pd.to_datetime(d_last["PERIOD"], errors="coerce")
-            .dt.to_period("M").dt.to_timestamp(how="start")
-            .dt.tz_localize(None)
-        )
-        # 2) Filtros del usuario aplicados sobre SKU fuente (vía jerarquías en 'j')
-        f = filters()
-        dims_key = _effective_dims(j, f)
-        mask_src = _mask_level(j, dims_key, "cat")  # empezamos con cat y refinamos abajo
-        if dims_key["sub"] != "ALL":   mask_src &= (j["SUBCATEGORIA_KEY"] == dims_key["sub"])
-        if dims_key["marca"] != "ALL": mask_src &= (j["MARCA_KEY"]        == dims_key["marca"])
-        if dims_key["sku"] != "ALL":   mask_src &= (j["SKU_KEY"]          == dims_key["sku"])
-        j_sel = j.loc[mask_src, ["SKU","SKU_KEY","CATEGORIA_KEY","SUBCATEGORIA_KEY","MARCA_KEY"]].drop_duplicates()
+            if j.empty:
+                return pd.DataFrame()
 
-        if j_sel.empty:
-            return pd.DataFrame(columns=["PERIOD_M","TYPE","TRANSFER_CU","CU_TOTAL","EXT_SHARE"])
-
-        # 3) CU mensual del último año SOLO para los SKU fuente seleccionados
-        d_last["SKU_KEY"] = _norm_series(d_last["SKU"])
-        d_src = d_last.merge(j_sel[["SKU","SKU_KEY"]].drop_duplicates(), on="SKU_KEY", how="inner")
-
-        if d_src.empty:
-            return pd.DataFrame(columns=["PERIOD_M","TYPE","TRANSFER_CU","CU_TOTAL","EXT_SHARE"])
-
-        # 4) Mapping UDM: unimos SOURCE_SKU -> DESTINATION_SKU/MFG y aplicamos ratio
-        m = df_vtm_map().copy()
-        if m.empty:
-            # Sin mapping: devolvemos series vacías pero CU total para referencias
-            cu_month = d_src.groupby("PERIOD_M", dropna=False)["CU"].sum(min_count=1).rename("CU_TOTAL").reset_index()
-            out = cu_month.assign(TYPE="Competencia", TRANSFER_CU=0.0)
-            out["EXT_SHARE"] = 0.0
-            return out
-
-        m["IS_SRC_COCA"]  = _is_coca(m.get("SRC_MFG",  pd.Series(index=m.index, dtype=str)))
-        m["IS_DEST_COCA"] = _is_coca(m.get("DEST_MFG", pd.Series(index=m.index, dtype=str)))
-
-        # Llaves de empalme robustas
-        m["SOURCE_SKU_KEY"] = _norm_series(m["SOURCE_SKU"])
-        d_src = d_src.merge(
-            m[["SOURCE_SKU_KEY","DESTINATION_SKU","SRC_MFG","DEST_MFG","VOLUME_TRANSFER","IS_SRC_COCA","IS_DEST_COCA"]],
-            left_on="SKU_KEY", right_on="SOURCE_SKU_KEY", how="left"
-        )
-
-        # 5) Tipo de flujo
-        d_src["TYPE"] = np.where(
-            (d_src["IS_SRC_COCA"] == True) & (d_src["IS_DEST_COCA"] == True), "Interna",
-            np.where((d_src["IS_SRC_COCA"] == True) & (d_src["IS_DEST_COCA"] == False), "Competencia", "Otro")
-        )
-        d_src = d_src[d_src["TYPE"].isin(["Interna","Competencia"])].copy()
-
-        # 6) Transferencia mensual estimada
-        d_src["VOLUME_TRANSFER"] = pd.to_numeric(d_src["VOLUME_TRANSFER"], errors="coerce")
-        d_src["CU"] = pd.to_numeric(d_src["CU"], errors="coerce")
-        d_src["TRANSFER_CU"] = (d_src["CU"].clip(lower=0) * d_src["VOLUME_TRANSFER"].clip(lower=0)).fillna(0.0)
-
-        # 7) Agregados mensuales
-        flows = (d_src.groupby(["PERIOD_M","TYPE"], dropna=False)["TRANSFER_CU"]
-                      .sum(min_count=1)
-                      .reset_index())
-
-        cu_month = (d_src.groupby(["PERIOD_M"], dropna=False)["CU"]
-                         .sum(min_count=1)
-                         .rename("CU_TOTAL")
-                         .reset_index())
-
-        out = flows.merge(cu_month, on="PERIOD_M", how="left")
-        out["EXT_SHARE"] = np.where(out["CU_TOTAL"]>0,
-                                    out["TRANSFER_CU"]/out["CU_TOTAL"],
-                                    np.nan)
-        out["PERIOD_M"] = (
-            pd.to_datetime(out["PERIOD_M"], errors="coerce")
-            .dt.to_period("M")
-            .dt.to_timestamp(how="start")   # ← inicio de mes
-            .dt.tz_localize(None)
-        )
-        out = out.sort_values(["PERIOD_M","TYPE"]).reset_index(drop=True)
-        return out
-
-    # ========= Elasticidad vs VTM (gráficos) =========
-
-    @render_widget
-    def fig_ev_correlation_timeline():
-        df = ev_monthly_flows().copy()
-
-        # Ventana del último año para garantizar eje X correcto
-        win_start, win_end = last_full_year_window(df_base())
-        # Índice mensual del año completo
-        cal = pd.date_range(win_start, win_end - pd.offsets.MonthBegin(0), freq="MS")
-
-        if df.empty:
-            # Figura vacía pero con rango temporal correcto
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            fig.update_xaxes(range=[cal.min(), cal.max()], type="date", tickformat="%b %Y")
-            fig.update_layout(
-                title="Transferencias mensuales (último año) vs Volumen y referencias de elasticidad",
-                height=440, margin=dict(l=10,r=10,t=40,b=10),
-                barmode="stack"
+            # ----------------------------
+            # Determinar nivel actual
+            # ----------------------------
+            lvl = level_sel()
+            level_col = (
+                "CATEGORIA" if lvl == "Total"
+                else "SUBCATEGORIA" if lvl == "Categoría"
+                else "MARCA" if lvl == "Subcategoría"
+                else "SKU"
             )
-            return fig
 
-        # Pivot y reindex al calendario completo
-        pivot = (df.pivot_table(index="PERIOD_M", columns="TYPE", values="TRANSFER_CU", aggfunc="sum")
-                .reindex(cal).fillna(0.0))
-        x = pivot.index
+            # ----------------------------
+            # Calcular agregados ponderados
+            # ----------------------------
+            j["W_CU"] = pd.to_numeric(j["W_CU"], errors="coerce").fillna(0)
+            j["PPG_PE"] = pd.to_numeric(j["PPG_PE"], errors="coerce")
+            j["NET_PE"] = pd.to_numeric(j["NET_PE"], errors="coerce")
+            j["VTM_RATIO"] = pd.to_numeric(j["VTM_RATIO"], errors="coerce")
 
-        cu_month = (df.groupby("PERIOD_M", dropna=False)["CU_TOTAL"].max()
-                    .reindex(cal).fillna(0.0))
+            def safe_avg(values, weights):
+                v = pd.to_numeric(values, errors="coerce")
+                w = pd.to_numeric(weights, errors="coerce").clip(lower=0)
+                mask = v.notna() & w.notna() & (w > 0)
+                if not mask.any() or w[mask].sum() == 0:
+                    return np.nan
+                return float(np.average(v[mask], weights=w[mask]))
 
-        # Referencias ponderadas
-        ctx = vtm_context(); j = ctx["joined"]
-        w_ppg = _wavg(j, "PPG_PE") if (j is not None and not j.empty) else np.nan
-        w_net = _wavg(j, "NET_PE") if (j is not None and not j.empty) else np.nan
+            df = (
+                j.groupby(level_col, dropna=False)
+                .apply(lambda g: pd.Series({
+                    "W_CU_TOT": g["W_CU"].sum(),
+                    "Elasticidad_bruta": safe_avg(g["PPG_PE"], g["W_CU"]),
+                    "Elasticidad_neta": safe_avg(g["NET_PE"], g["W_CU"]),
+                    "VTM_Ratio": safe_avg(g["VTM_RATIO"], g["W_CU"]),
+                }))
+                .reset_index()
+            )
 
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        if "Interna" in pivot.columns:
-            fig.add_trace(go.Bar(x=x, y=pivot["Interna"], name="Transferencia Interna"), secondary_y=False)
-        if "Competencia" in pivot.columns:
-            fig.add_trace(go.Bar(x=x, y=pivot["Competencia"], name="Transferencia a Competencia"), secondary_y=False)
+            # ----------------------------
+            # Cálculos derivados
+            # ----------------------------
+            df["Elasticidad_gap"] = df["Elasticidad_bruta"] - df["Elasticidad_neta"]
+            df["Sensibilidad"] = np.where(df["Elasticidad_neta"].abs() > 1, "Alta", "Baja")
+            df["Riesgo_VTM"] = np.where(df["VTM_Ratio"] > 0.5, "Competencia", "Interna")
 
-        fig.add_trace(go.Scatter(x=x, y=cu_month, name="CU Total", mode="lines+markers"), secondary_y=True)
+            def clasificar_fila(row):
+                if pd.isna(row["Elasticidad_neta"]):
+                    return "Sin dato"
+                if row["Sensibilidad"] == "Alta" and row["Riesgo_VTM"] == "Competencia":
+                    return "🔴 Crítico: pérdida externa"
+                elif row["Sensibilidad"] == "Alta" and row["Riesgo_VTM"] == "Interna":
+                    return "🟠 Canibalización interna"
+                elif row["Sensibilidad"] == "Baja" and row["Riesgo_VTM"] == "Competencia":
+                    return "🟡 Estable, pero vigilado"
+                elif row["Sensibilidad"] == "Baja" and row["Riesgo_VTM"] == "Interna":
+                    return "🟢 Portafolio sólido"
+                else:
+                    return "Sin dato"
 
-        if pd.notna(w_ppg):
-            fig.add_hline(y=w_ppg, line_dash="dot", annotation_text="PPG_PE (ref)", annotation_position="top left")
-        if pd.notna(w_net):
-            fig.add_hline(y=w_net, line_dash="dash", annotation_text="NET_PE (ref)", annotation_position="bottom left")
+            df["Clasificacion"] = df.apply(clasificar_fila, axis=1)
+            df = df.rename(columns={level_col: "Entidad"})
+            return df
 
-        fig.update_layout(
-            barmode="stack",
-            title="Transferencias mensuales (último año) vs Volumen y referencias de elasticidad",
-            height=440, margin=dict(l=10,r=10,t=40,b=10),
-            legend=dict(orientation="h", y=-0.2)
-        )
-        fig.update_yaxes(title_text="CU transferido (estimado)", secondary_y=False, showgrid=True, gridcolor=COCA_GRAY_LIGHT)
-        fig.update_yaxes(title_text="CU Total", secondary_y=True, showgrid=False)
-        fig.update_xaxes(range=[cal.min(), cal.max()], type="date", tickformat="%b %Y")
-        return fig
+        except Exception as e:
+            print("Error en sensibilidad_nivel_tabla_df:", e)
+            return pd.DataFrame()
 
 
-    @render_widget
-    def fig_ev_scatter_vtm_gap():
-        """
-        Scatter: VTM_RATIO vs brecha (PPG_PE - NET_PE), tamaño por W_CU.
-        Cross-sectional en el último año; útil para ver correlación directa.
-        """
-        ctx = vtm_context()
-        j = ctx["joined"].copy()
-        if j.empty:
-            return go.Figure()
-        j["gap"] = pd.to_numeric(j["PPG_PE"], errors="coerce") - pd.to_numeric(j["NET_PE"], errors="coerce")
-        j["W_CU"] = pd.to_numeric(j["W_CU"], errors="coerce").fillna(0)
-
-        fig = px.scatter(
-            j, x="VTM_RATIO", y="gap", size="W_CU",
-            hover_data=["SKU","MARCA","SUBCATEGORIA","CATEGORIA"],
-            title="VTM_RATIO vs (PPG_PE − NET_PE) — tamaño por volumen (último año)"
-        )
-        fig.add_hline(y=0, line_dash="dot")
-        fig.update_layout(height=420, margin=dict(l=10,r=10,t=40,b=10))
-        return fig
-
-    @render_widget
-    def fig_ev_stack_flows():
-        df = ev_monthly_flows().copy()
+    # ----------------------------
+    # Render de tabla (usa la nueva función)
+    # ----------------------------
+    @render.data_frame
+    def tabla_sensibilidad():
+        df = sensibilidad_nivel_tabla_df().copy()
         if df.empty:
-            # fija el rango del último año aunque esté vacío
-            win_start, win_end = last_full_year_window(df_base())
-            cal = pd.date_range(win_start, win_end - pd.offsets.MonthBegin(0), freq="MS")
-            fig = go.Figure()
-            fig.update_layout(title="Transferencia estimada por mes — Interna vs Competencia",
-                            height=420, margin=dict(l=10,r=10,t=40,b=10), legend=dict(orientation="h"))
-            fig.update_xaxes(type="date", tickformat="%b %Y", range=[cal.min(), cal.max()])
-            fig.update_yaxes(title_text="CU transferido")
-            return fig
+            return pd.DataFrame(columns=["Entidad", "Elasticidad_bruta", "Elasticidad_neta", "VTM_Ratio", "Clasificacion"])
 
-        # asegura fechas limpias
-        df["PERIOD_M"] = pd.to_datetime(df["PERIOD_M"], errors="coerce").dt.tz_localize(None)
-        df = df.dropna(subset=["PERIOD_M"])
+        df["Elasticidad_bruta"] = df["Elasticidad_bruta"].round(2)
+        df["Elasticidad_neta"] = df["Elasticidad_neta"].round(2)
+        df["Elasticidad_gap"] = df["Elasticidad_gap"].round(2)
+        df["VTM_Ratio"] = (df["VTM_Ratio"] * 100).round(1)
 
-        df_bar = (df.groupby(["PERIOD_M","TYPE"], dropna=False)["TRANSFER_CU"]
-                    .sum(min_count=1).reset_index().sort_values("PERIOD_M"))
+        df = df.rename(columns={
+            "Entidad": "Nombre",
+            "W_CU_TOT": "Volumen ponderado (CU)",
+            "Elasticidad_bruta": "Elasticidad Bruta",
+            "Elasticidad_neta": "Elasticidad Neta",
+            "Elasticidad_gap": "Δε (Gap)",
+            "VTM_Ratio": "VTM (%)",
+            "Riesgo_VTM": "Dirección Flujo",
+            "Sensibilidad": "Sensibilidad",
+            "Clasificacion": "Clasificación estratégica"
+        })
 
-        # rango del último año SIEMPRE
-        win_start, win_end = last_full_year_window(df_base())
-        cal = pd.date_range(win_start, win_end - pd.offsets.MonthBegin(0), freq="MS")
-
-        fig = px.bar(
-            df_bar, x="PERIOD_M", y="TRANSFER_CU", color="TYPE", barmode="stack",
-            labels={"PERIOD_M":"Periodo","TRANSFER_CU":"CU transferido", "TYPE":"Tipo"},
-            title="Transferencia estimada por mes — Interna vs Competencia"
-        )
-        fig.update_layout(height=420, margin=dict(l=10,r=10,t=40,b=10), legend=dict(orientation="h"))
-        fig.update_xaxes(type="date", tickformat="%b %Y", range=[cal.min(), cal.max()])
-        return fig
+        cols = [
+            "Nombre", "Volumen ponderado (CU)", "Elasticidad Bruta", "Elasticidad Neta",
+            "Δε (Gap)", "VTM (%)", "Dirección Flujo", "Sensibilidad", "Clasificación estratégica"
+        ]
+        return df[cols]
 
 
-    @render.download(filename="ev_monthly_flows.csv")
-    def dl_ev_monthly_flows():
-        df = ev_monthly_flows().copy()
+
+    @render.download(filename="sensibilidad_precio_volumen.csv")
+    def dl_sensibilidad():
+        df = sensibilidad_nivel_df().copy()
         if df.empty:
-            yield b""; return
-        out = df.sort_values(["PERIOD_M","TYPE"]).copy()
-        yield out.to_csv(index=False).encode("utf-8")
+            yield b""
+        else:
+            yield df.to_csv(index=False).encode("utf-8")
 
-
-    # ===== Pestaña Insights: KPIs y gráficos
-    # -------- KPIs fila 1: PPG_PE
+    # KPIs (arriba del gráfico de sensibilidad)
     @render.ui
-    def kpi_ppg_cat():
-        if not _kpi_show_flags(filters())["cat"]:
-            return ui.div(style="display:none;")
+    def kpi_sens_ppg():
         j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "PPG_PE", filters(), "cat")
-        return kpi_card("PPG_PE — Categoría", f"{val:.4f}" if pd.notna(val) else "—")
+        val = _wavg_metric_at_level(j, "PPG_PE", filters())
+        return kpi_card("Elasticidad Bruta (PPG_PE)", f"{val:.2f}" if pd.notna(val) else "—")
 
     @render.ui
-    def kpi_ppg_sub():
-        if not _kpi_show_flags(filters())["sub"]:
-            return ui.div(style="display:none;")
+    def kpi_sens_vtm():
         j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "PPG_PE", filters(), "sub")
-        return kpi_card("PPG_PE — Subcategoría", f"{val:.4f}" if pd.notna(val) else "—")
+        val = _wavg_metric_at_level(j, "VTM_RATIO", filters())
+        return kpi_card("VTM Ratio promedio", f"{val:.2f}" if pd.notna(val) else "—")
 
     @render.ui
-    def kpi_ppg_marca():
-        if not _kpi_show_flags(filters())["marca"]:
-            return ui.div(style="display:none;")
+    def kpi_sens_net():
         j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "PPG_PE", filters(), "marca")
-        return kpi_card("PPG_PE — Marca", f"{val:.4f}" if pd.notna(val) else "—")
+        val = _wavg_metric_at_level(j, "NET_PE", filters())
+        return kpi_card("Elasticidad Neta (NET_PE)", f"{val:.2f}" if pd.notna(val) else "—")
 
     @render.ui
-    def kpi_ppg_sku():
-        if not _kpi_show_flags(filters())["sku"]:
-            return ui.div(style="display:none;")
+    def kpi_sens_dir():
         j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "PPG_PE", filters(), "sku")
-        return kpi_card("PPG_PE — SKU", f"{val:.4f}" if pd.notna(val) else "—")
+        val = _wavg_metric_at_level(j, "VTM_RATIO", filters())
+        estado = "Competencia" if (pd.notna(val) and val > 0.5) else "Interna"
+        color = "#E41E26" if estado=="Competencia" else "#2ECC71"
+        return kpi_card("Dirección de Volumen", ui.HTML(f"<span style='color:{color}'>{estado}</span>"))
 
-    # -------- KPIs fila 2: VTM_RATIO
-    @render.ui
-    def kpi_vtm_cat():
-        if not _kpi_show_flags(filters())["cat"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "VTM_RATIO", filters(), "cat")
-        return kpi_card("VTM Ratio — Categoría", f"{val:.3f}" if pd.notna(val) else "—")
-
-    @render.ui
-    def kpi_vtm_sub():
-        if not _kpi_show_flags(filters())["sub"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "VTM_RATIO", filters(), "sub")
-        return kpi_card("VTM Ratio — Subcategoría", f"{val:.3f}" if pd.notna(val) else "—")
-
-    @render.ui
-    def kpi_vtm_marca():
-        if not _kpi_show_flags(filters())["marca"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "VTM_RATIO", filters(), "marca")
-        return kpi_card("VTM Ratio — Marca", f"{val:.3f}" if pd.notna(val) else "—")
-
-    @render.ui
-    def kpi_vtm_sku():
-        if not _kpi_show_flags(filters())["sku"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "VTM_RATIO", filters(), "sku")
-        return kpi_card("VTM Ratio — SKU", f"{val:.3f}" if pd.notna(val) else "—")
-
-    # -------- KPIs fila 3: NET_PE
-    @render.ui
-    def kpi_net_cat():
-        if not _kpi_show_flags(filters())["cat"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "NET_PE", filters(), "cat")
-        return kpi_card("NET_PE — Categoría", f"{val:.4f}" if pd.notna(val) else "—")
-
-    @render.ui
-    def kpi_net_sub():
-        if not _kpi_show_flags(filters())["sub"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "NET_PE", filters(), "sub")
-        return kpi_card("NET_PE — Subcategoría", f"{val:.4f}" if pd.notna(val) else "—")
-
-    @render.ui
-    def kpi_net_marca():
-        if not _kpi_show_flags(filters())["marca"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "NET_PE", filters(), "marca")
-        return kpi_card("NET_PE — Marca", f"{val:.4f}" if pd.notna(val) else "—")
-
-    @render.ui
-    def kpi_net_sku():
-        if not _kpi_show_flags(filters())["sku"]:
-            return ui.div(style="display:none;")
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "NET_PE", filters(), "sku")
-        return kpi_card("NET_PE — SKU", f"{val:.4f}" if pd.notna(val) else "—")
-
-
-    @render_widget
-    def fig_transfer_sankey():
-        ctx = transfer_ctx()
-        flows = ctx["flows"].copy()
-        if flows.empty:
-            return go.Figure()
-
-        sel = _flows_mask_for_filters(flows, filters())
-        flows = flows[sel].copy()
-        if flows.empty:
-            return go.Figure()
-
-        # Agrega por fabricante destino (competencia) y toma Top N
-        agg = (flows.groupby("DEST_MFG", dropna=False)["TRANSFER_CU"]
-                    .sum(min_count=1)
-                    .reset_index()
-                    .sort_values("TRANSFER_CU", ascending=False))
-        if agg.empty:
-            return go.Figure()
-
-        topN = 5
-        top = agg.head(topN)
-        others = agg.iloc[topN:]["TRANSFER_CU"].sum()
-        if others > 0:
-            top = pd.concat([top, pd.DataFrame({"DEST_MFG": ["OTROS"], "TRANSFER_CU": [others]})],
-                            ignore_index=True)
-
-        source_label = "Portafolio filtrado"
-        nodes = [source_label] + top["DEST_MFG"].astype(str).tolist()
-        idx = {lbl: i for i, lbl in enumerate(nodes)}
-
-        links = dict(
-            source=[idx[source_label]] * len(top),
-            target=[idx[x] for x in top["DEST_MFG"].astype(str)],
-            value=top["TRANSFER_CU"].tolist(),
-            label=top["DEST_MFG"].astype(str).tolist(),
-        )
-
-        sank = go.Sankey(
-            orientation="v",                     # ← vertical
-            arrangement="snap",
-            node=dict(
-                label=nodes,
-                pad=14,
-                thickness=18,
-                line=dict(color="#bbb", width=0.5),
-            ),
-            link=links,
-            domain=dict(x=[0.0, 1.0], y=[0.0, 1.0]),
-        )
-
-        fig = go.Figure(sank)
-
-        # Altura dinámica para que quepan más etiquetas
-        n_targets = len(top)
-        h = max(420, min(220 + 44 * n_targets, 1000))
-
-        fig.update_layout(
-            title="Volume transfer → Competencia (ponderado por CU último año)",
-            height=h,
-            margin=dict(l=10, r=10, t=50, b=10),
-        )
-        return fig
-
-    
-    @render_widget
-    def fig_transfer_topdest():
-        ctx = transfer_ctx()
-        flows = ctx["flows"].copy()
-        if flows.empty: return go.Figure()
-        sel = _flows_mask_for_filters(flows, filters())
-        flows = flows[sel].copy()
-        if flows.empty: return go.Figure()
-
-        # Top SKUs destino (competencia)
-        dest = (flows.groupby(["DESTINATION_SKU","DEST_MFG"], dropna=False)["TRANSFER_CU"]
-                    .sum(min_count=1)
-                    .reset_index()
-                    .sort_values("TRANSFER_CU", ascending=False)
-                )
-        dest = dest.head(20)
-        if dest.empty: return go.Figure()
-
-        fig = px.bar(
-            dest.sort_values("TRANSFER_CU"),
-            x="TRANSFER_CU", y="DESTINATION_SKU", orientation="h",
-            color="DEST_MFG",
-            title="Top SKUs de competencia que capturan volumen (último año)",
-            labels={"TRANSFER_CU":"CU transferido estimado", "DESTINATION_SKU":"SKU destino", "DEST_MFG":"Fabricante"}
-        )
-        fig.update_layout(height=460, margin=dict(l=10,r=10,t=40,b=10), legend=dict(orientation="h"))
-        return fig
-
-
-
-    @render_widget
-    def fig_eps_scatter():
-        j = vtm_context()["joined"].copy()
-        if j.empty: return go.Figure()
-        j["W_CU"] = j["W_CU"].fillna(0)
-        fig = px.scatter(
-            j, x="PPG_PE", y="NET_PE", size="W_CU", color="VTM_RATIO",
-            hover_data=["SKU","MARCA","SUBCATEGORIA","CATEGORIA"],
-            title="Bruta (PPG_PE) vs Neta (NET_PE) — tamaño por volumen último año"
-        )
-        fig.add_trace(go.Scatter(x=[-5,5], y=[-5,5], mode="lines", name="y=x", line=dict(dash="dash")))
-        fig.update_layout(height=CHART_H, margin=dict(l=10,r=10,t=40,b=10))
-        return fig
-
-    @render.download(filename="elasticidad_vtm_insights.csv")
-    def dl_vtm():
-        j = vtm_context()["joined"].copy()
-        if j.empty: yield b""; return
-        yield j.to_csv(index=False).encode("utf-8")
-
-    # ===== TAB 1 KPIs (último año y sin 'modelo')
+    # ================= Línea de tiempo (ajustada para incluir 'Marca')
     @render.ui
     def kpi_1():
         base = df_joined().copy()
@@ -1307,29 +943,26 @@ def server(input, output, session):
                 base["epsilon_teor"] = (dln_q / dln_p).replace([np.inf, -np.inf], np.nan)
             work = base.copy(); col_eps = "epsilon_teor"
 
-        entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "SKU": "SKU"}
+        entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "Marca": "MARCA", "SKU": "SKU"}
         serie = monthly_eps_weighted(work, col_eps, entity_map.get(level_sel()))
         return kpi_card("Meses con elasticidad calculada", f"{int(serie['eps'].notna().sum()):,}")
 
     @render.ui
     def kpi_2():
-        # PPG_PE ponderada (último año)
         ctx = vtm_context()
         j = ctx["joined"]
         if j.empty: return kpi_card("PPG_PE ponderada (bruta)", "—")
-        val = _wavg(j, "PPG_PE")
+        val = _wavg_metric_at_level(j, "PPG_PE", filters())
         return kpi_card("PPG_PE ponderada (bruta)", f"{val:.4f}" if pd.notna(val) else "—")
 
     @render.ui
     def kpi_3():
-        # NET_PE ponderada (último año)
         ctx = vtm_context()
         j = ctx["joined"]
         if j.empty: return kpi_card("NET_PE ponderada (neta)", "—")
-        val = _wavg(j, "NET_PE")
+        val = _wavg_metric_at_level(j, "NET_PE", filters())
         return kpi_card("NET_PE ponderada (neta)", f"{val:.4f}" if pd.notna(val) else "—")
 
-    # ===== TAB 1 chart (último año; líneas de referencia PPG_PE / NET_PE)
     @render_widget
     def fig_linea():
         base = df_joined().copy()
@@ -1339,7 +972,6 @@ def server(input, output, session):
         if f['marca'] != "All" and "MARCA" in base.columns: base = base[base["MARCA"] == f['marca']]
         if f['sku'] != "All" and "SKU" in base.columns: base = base[base["SKU"] == f['sku']]
 
-        # Ventana último año completa
         win_start, win_end = last_full_year_window(df_base())
         base = base[(base["PERIOD"] >= win_start) & (base["PERIOD"] < win_end)].copy()
         if base.empty: return go.Figure()
@@ -1361,16 +993,14 @@ def server(input, output, session):
                 base["epsilon_teor"] = (dln_q / dln_p).replace([np.inf, -np.inf], np.nan)
             work = base.copy(); col_eps = "epsilon_teor"; linea_label = "Elasticidad Teórica"
 
-        entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "SKU": "SKU"}
+        entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "Marca": "MARCA", "SKU": "SKU"}
         serie = monthly_eps_weighted(work, col_eps, entity_map.get(level_sel()))
 
-        # Referencias PPG_PE & NET_PE ponderadas en el mismo último año y con filtros
         ctx = vtm_context()
         j = ctx["joined"]
-        w_ppg = _wavg(j, "PPG_PE") if not j.empty else np.nan
-        w_net = _wavg(j, "NET_PE") if not j.empty else np.nan
+        w_ppg = _wavg_metric_at_level(j, "PPG_PE", filters())
+        w_net = _wavg_metric_at_level(j, "NET_PE", filters())
 
-        # Eje X
         serie["PERIOD_M"] = pd.to_datetime(serie["PERIOD_M"], errors="coerce")
         x_dates = serie["PERIOD_M"].dt.tz_localize(None).dt.to_pydatetime()
 
@@ -1429,19 +1059,19 @@ def server(input, output, session):
                 base["epsilon_teor"] = (dln_q / dln_p).replace([np.inf, -np.inf], np.nan)
             work = base.copy(); col_eps = "epsilon_teor"
 
-        entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "SKU": "SKU"}
+        entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "Marca": "MARCA", "SKU": "SKU"}
         serie = monthly_eps_weighted(work, col_eps, entity_map.get(level_sel()))
-        # refs
+
         ctx = vtm_context(); j = ctx["joined"]
-        w_ppg = _wavg(j, "PPG_PE") if not j.empty else np.nan
-        w_net = _wavg(j, "NET_PE") if not j.empty else np.nan
+        w_ppg = _wavg_metric_at_level(j, "PPG_PE", filters())
+        w_net = _wavg_metric_at_level(j, "NET_PE", filters())
 
         out = serie.rename(columns={"PERIOD_M": "PERIOD", "eps": "eps_mensual"}).copy()
         out["PPG_PE_ref"] = w_ppg
         out["NET_PE_ref"] = w_net
         yield out.to_csv(index=False).encode("utf-8")
 
-    # ================= TAB 3: Clasificación (sin cambios de lógica base)
+    # ================= Clasificación
     def classify_elasticity(e):
         if pd.isna(e): return "Sin dato"
         ae = abs(float(e))
@@ -1466,6 +1096,8 @@ def server(input, output, session):
             entity_col = "CATEGORIA" if "CATEGORIA" in dj5.columns else "SKU";  nivel_txt = "Categoría" if entity_col == "CATEGORIA" else "SKU"
         elif lvl == "Categoría":
             entity_col = "SUBCATEGORIA" if "SUBCATEGORIA" in dj5.columns else "SKU"; nivel_txt = "Subcategoría" if entity_col == "SUBCATEGORIA" else "SKU"
+        elif lvl == "Marca" and "MARCA" in dj5.columns:
+            entity_col = "SKU"; nivel_txt = "SKU"
         else:
             entity_col = "SKU"; nivel_txt = "SKU"
         if entity_col not in dj5.columns: return go.Figure()
@@ -1509,7 +1141,7 @@ def server(input, output, session):
         if dj.empty: yield b""; return
         yield dj.to_csv(index=False).encode("utf-8")
 
-    # ================= TAB 4: Explorador
+    # ================= Explorador (agrega 'Marca')
     @render_widget
     def fig_explorer():
         d = df_filtered().copy()
@@ -1541,7 +1173,7 @@ def server(input, output, session):
             ))
             fig.update_layout(title="Δ% mensual: Precio vs. CU — Total", hovermode="x unified", showlegend=True,
                               yaxis=dict(showgrid=True, gridcolor=COCA_GRAY_LIGHT, title="Δ% vs. mes anterior"),
-                              xaxis=dict(showgrid=False), height=CHART_H, margin=dict(l=10,r=10,t=30,b=10))
+                              xaxis=dict(showgrid=False), height=CHART_H, margin=dict(l=10, r=10, t=30, b=10))
             fig.add_hline(y=0, line_width=1, line_dash="dot")
             return fig
         else:
@@ -1551,6 +1183,8 @@ def server(input, output, session):
                 group.append("CATEGORIA"); entity_col = "CATEGORIA"
             elif lvl=="Subcategoría" and "SUBCATEGORIA" in d.columns:
                 group.append("SUBCATEGORIA"); entity_col = "SUBCATEGORIA"
+            elif lvl=="Marca" and "MARCA" in d.columns:
+                group.append("MARCA"); entity_col = "MARCA"
             elif lvl=="SKU" and "SKU" in d.columns:
                 group.append("SKU"); entity_col = "SKU"
             agg = d.groupby(group, dropna=False)[metric_col].sum().reset_index()
@@ -1559,7 +1193,7 @@ def server(input, output, session):
                           title=f"{lvl} mensual — {titulo_metric}")
             fig.update_traces(mode="lines", line=dict(width=2), hovertemplate="<b>%{fullData.name}</b><br>%{x|%Y-%m}: %{y:,}")
             fig.update_layout(title=dict(x=0.01), hovermode="x unified", showlegend=False, xaxis=dict(showgrid=False),
-                              yaxis=dict(showgrid=True, gridcolor=COCA_GRAY_LIGHT), height=CHART_H, margin=dict(l=10,r=10,t=30,b=10))
+                              yaxis=dict(showgrid=True, gridcolor=COCA_GRAY_LIGHT), height=CHART_H, margin=dict(l=10, r=10, t=30, b=10))
             return fig
 
     @render.download(filename=lambda: f"{level_sel()}_{'cu' if input.metric_mode()=='Volumen (CU)' else 'ingreso_neto'}.csv")
@@ -1567,7 +1201,7 @@ def server(input, output, session):
         d = df_filtered().copy()
         yield d.to_csv(index=False).encode("utf-8")
 
-    # ================= TAB 6: Bennett
+    # ================= Bennett
     @render_widget
     def fig_bennett():
         d_rev = df_filtered().copy()
