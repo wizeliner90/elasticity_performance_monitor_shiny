@@ -360,47 +360,102 @@ def df_mt_pe() -> pd.DataFrame:
     for c in ["PPG_PE","VTM_RATIO","NET_PE"]:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
+    
+    if "SKU" in d.columns:
+        d["SKU"] = (
+            d["SKU"]
+            .astype(str)
+            .str.upper()
+            .str.replace(r"\bLATA\b", "ALUMINIO", regex=True)
+            .str.replace(r"\bLATAS\b", "ALUMINIO", regex=True)
+        )
+
+    for c in ["CATEGORIA", "SUBCATEGORIA", "MARCA"]:
+        if c in d.columns:
+            d[c] = _norm_series(d[c])
     return d
 
 @reactive.Calc
 def df_vtm_map() -> pd.DataFrame:
+    """
+    Mapea los flujos de volumen (VTM) con jerarquía consistente.
+    - Usa SOURCE_SKU para derivar la Marca (no EMBOTELLADOR_REVISED)
+    - Añade SUBCATEGORIA desde mt_consolidated_pe
+    - Marca banderas de fabricante Coca-Cola en origen y destino
+    """
     try:
-        d = read_table_local("udm_vtm_melted_mapping")  # parquet/csv en ./data
+        vtm = read_table_local("udm_vtm_melted_mapping")
     except FileNotFoundError:
-        p = pathlib.Path(__file__).parent / "data" / "udm_vtm_melted_mapping.csv"
-        if p.exists():
-            d = pd.read_csv(p)
+        return pd.DataFrame(columns=[
+            "SOURCE_SKU","DESTINATION_SKU","SRC_MFG","DEST_MFG",
+            "VOLUME_TRANSFER","UNIT_MIX","REVISED_CATEGORY"
+        ])
+
+    # --- Normalización de nombres base
+    vtm = vtm.rename(columns={
+        "REVISED_CATEGORY": "CATEGORIA",
+        "VOLUME_TRANSFER": "VOLUME_TRANSFER"
+    })
+
+    # --- Asegurar columnas requeridas
+    for col in ["SOURCE_SKU", "DESTINATION_SKU", "SRC_MFG", "DEST_MFG"]:
+        if col not in vtm.columns:
+            vtm[col] = np.nan
+
+    # --- Derivar Marca desde SOURCE_SKU
+    import re
+
+    def extraer_marca(source_sku: str) -> str:
+        """
+        Extrae la 'marca' del texto SOURCE_SKU tomando todo lo que aparece
+        antes de las palabras clave PET, VIDRIO, TETRAPACK, LATA, GARRAFON o REF.
+        Si no hay coincidencia, devuelve las primeras 1–2 palabras.
+        """
+        if not isinstance(source_sku, str) or not source_sku.strip():
+            return "DESCONOCIDO"
+        s = source_sku.upper().strip()
+        s = s.replace("-", " ").replace("_", " ").replace(".", " ")
+        patron = r"^(.*?)(?=\b(PET|VIDRIO|TETRAPACK|LATA|GARRAFON|REF)\b)"
+        m = re.search(patron, s)
+        if m:
+            marca = m.group(1).strip()
         else:
-            return pd.DataFrame(columns=[
-                "SOURCE_SKU","DESTINATION_SKU","SRC_MFG","DEST_MFG",
-                "VOLUME_TRANSFER","UNIT_MIX","REVISED_CATEGORY","MARCA_REVISED_V2"
-            ])
+            partes = s.split()
+            marca = " ".join(partes[:2]).strip()
 
-    # columnas esperadas
-    rename = {
-        "SOURCE_SKU":"SOURCE_SKU",
-        "DESTINATION_SKU":"DESTINATION_SKU",
-        "SRC_MFG":"SRC_MFG",
-        "DEST_MFG":"DEST_MFG",
-        "VOLUME_TRANSFER":"VOLUME_TRANSFER",
-        "UNIT_MIX":"UNIT_MIX",
-        "REVISED_CATEGORY":"REVISED_CATEGORY",
-        "MARCA_REVISED_V2":"MARCA_REVISED_V2",
-    }
-    d = d.rename(columns=rename)
+        # --- Limpieza de caracteres ---
+        marca = re.sub(r"[^A-Z0-9ÁÉÍÓÚÑ ]+", "", marca).strip()
 
-    for c in ["VOLUME_TRANSFER","UNIT_MIX"]:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
+        # --- Corrección para mantener formato con guiones ---
+        marca = re.sub(r"\bCOCA COLA\b", "COCA-COLA", marca)
+        marca = re.sub(r"\bSIN AZUCAR\b", "SIN AZUCAR", marca)
+        return marca or "DESCONOCIDO"
 
-    # llaves normalizadas
-    d["SOURCE_SKU_KEY"] = _norm_series(d["SOURCE_SKU"])
-    d["DEST_SKU_KEY"]   = _norm_series(d["DESTINATION_SKU"])
-    d["SRC_MFG_KEY"]    = _norm_series(d.get("SRC_MFG", pd.Series(index=d.index, dtype=str)))
-    d["DEST_MFG_KEY"]   = _norm_series(d.get("DEST_MFG", pd.Series(index=d.index, dtype=str)))
-    d["IS_SRC_COCA"]    = d["SRC_MFG_KEY"].str.contains("COCA", na=False)
-    d["IS_DEST_COCA"]   = d["DEST_MFG_KEY"].str.contains("COCA", na=False)
-    return d
+    vtm["MARCA"] = vtm["SOURCE_SKU"].apply(extraer_marca)
+
+    # --- Traer SUBCATEGORÍA desde mt_consolidated_pe
+    try:
+        mt = read_table_local("mt_consolidated_pe")[["PPG", "SUB_CATEGORY"]]
+        mt = mt.rename(columns={"PPG": "SOURCE_SKU", "SUB_CATEGORY": "SUBCATEGORIA"})
+        vtm = vtm.merge(mt, on="SOURCE_SKU", how="left")
+    except FileNotFoundError:
+        vtm["SUBCATEGORIA"] = np.nan
+
+    # --- Normalizar claves y texto
+    for c in ["CATEGORIA", "SUBCATEGORIA", "MARCA", "SOURCE_SKU", "DESTINATION_SKU"]:
+        vtm[c] = vtm[c].astype(str).str.strip().str.upper()
+
+    # --- Banderas de fabricante
+    vtm["SRC_MFG_KEY"] = _norm_series(vtm["SRC_MFG"])
+    vtm["DEST_MFG_KEY"] = _norm_series(vtm["DEST_MFG"])
+    vtm["IS_SRC_COCA"] = vtm["SRC_MFG_KEY"].str.contains("COCA", na=False)
+    vtm["IS_DEST_COCA"] = vtm["DEST_MFG_KEY"].str.contains("COCA", na=False)
+
+    # --- Filtrar registros con VOLUME_TRANSFER válido
+    vtm["VOLUME_TRANSFER"] = pd.to_numeric(vtm["VOLUME_TRANSFER"], errors="coerce").fillna(0)
+    vtm = vtm[vtm["VOLUME_TRANSFER"] > 0].copy()
+
+    return vtm
 
 
 def last_full_year_window(dseries: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -411,7 +466,7 @@ def last_full_year_window(dseries: pd.DataFrame) -> tuple[pd.Timestamp, pd.Times
     else:
         end_m = pd.to_datetime(dseries["PERIOD"]).max()
         end_m = pd.Timestamp(year=end_m.year, month=end_m.month, day=1)
-    start_m = (end_m - pd.offsets.DateOffset(months=11)).normalize()
+    start_m = (end_m - pd.offsets.DateOffset(months=24)).normalize()
     return (start_m, (end_m + pd.offsets.MonthEnd(1)))
 
 # =====================
@@ -430,41 +485,174 @@ app_ui = ui.page_fluid(
         href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap"
     ),
     ui.tags.style("""
-        html, body { font-family: 'Montserrat', sans-serif; }
-        .muted { color: #666; font-size: 12px; }
+    html, body {
+    font-family: 'Montserrat', sans-serif;
+    height: 100%;
+    overflow-y: auto;
+    }
 
-        /* ---- TABS pro: 1 fila, centrados, 2 líneas, sin scroll ---- */
-        .nav.nav-tabs {
-          display: flex;
-          flex-wrap: nowrap;
-          border-bottom: 2px solid #E9ECEF;
-          gap: 4px;
+    /* ---- Navegación de tabs ---- */
+    .nav.nav-tabs {
+    display: flex;
+    flex-wrap: nowrap;
+    border-bottom: 2px solid #E9ECEF;
+    gap: 4px;
+    }
+    .nav.nav-tabs .nav-item {
+    flex: 1 1 0;
+    min-width: 0;
+    }
+    .nav.nav-tabs .nav-link {
+    width: 100%;
+    text-align: center;
+    font-weight: 600;
+    font-size: 13px;
+    line-height: 1.15;
+    white-space: normal;
+    height: 2.7em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #4B4B4B;
+    padding: 8px 6px;
+    }
+    .nav.nav-tabs .nav-link.active {
+    color: #E41E26 !important;
+    border-color: #E41E26 #E41E26 #fff !important;
+    }
+
+    /* ---- Sidebar que se desplaza junto con el scroll ---- */
+    .bslib-page-sidebar {
+        display: flex !important;        
+        align-items: flex-start !important;
+        overflow: visible !important;   
+    }
+
+    .sidebar-scroll {
+        position: sticky !important;
+        top: 10px;
+        align-self: flex-start;
+        max-height: calc(100vh - 20px);
+        overflow-y: auto;
+        background-color: #ffffff;
+        padding: 15px;
+        border-right: 1px solid #e0e0e0;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        scrollbar-width: thin;
+        scrollbar-color: #E41E26 #f5f5f5;
+    }
+
+    /* Scrollbar personalizado (para Chrome, Edge, Safari) */
+    .sidebar-scroll::-webkit-scrollbar {
+        width: 8px;
+    }
+    .sidebar-scroll::-webkit-scrollbar-thumb {
+        background-color: #E41E26;
+        border-radius: 4px;
+    }
+    .sidebar-scroll::-webkit-scrollbar-track {
+        background: #f5f5f5;
+    }
+
+    /* ---- Alineación del layout ---- */
+    .layout-sidebar {
+        display: flex;
+        align-items: flex-start !important;
+        overflow: visible !important;
+    }
+
+    /* ---- Contenido principal ---- */
+    .main-content {
+    flex: 1;
+    overflow: visible;
+    padding: 20px;
+    }
+
+    /* ---- Tipografía secundaria ---- */
+    .muted {
+    color: #666;
+    font-size: 12px;
+    }
+    """),
+
+    ui.tags.style("""
+    /* === Fila de gráficos lado a lado === */
+    .fila-graficos {
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        gap: 20px;
+        flex-wrap: wrap;  /* permite que se apilen en pantallas pequeñas */
+        width: 100%;
+        margin: 30px auto;
+        max-width: 95vw;
+    }
+
+    .grafico-izquierdo, .grafico-derecho {
+        flex: 1 1 48%;
+        max-width: 48%;
+        min-width: 400px;
+        background-color: #FFFFFF;
+        border: 1px solid #E9ECEF;
+        border-radius: 12px;
+        padding: 10px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    }
+
+    .grafico-izquierdo .plotly-container,
+    .grafico-derecho .plotly-container {
+        width: 100% !important;
+        height: auto !important;
+    }
+
+    @media (max-width: 1100px) {
+        .grafico-izquierdo, .grafico-derecho {
+            flex: 1 1 100%;
+            max-width: 100%;
         }
-        .nav.nav-tabs .nav-item {
-          flex: 1 1 0;
-          min-width: 0;
+    }
+    .bloque-elasticidad {
+        width: 100%;
+        max-width: 95vw;
+        margin: 25px auto;
+        background-color: #FFFFFF;
+        border: 1px solid #E9ECEF;
+        border-radius: 10px;
+        padding: 15px 25px;
+        text-align: center;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    }
+    """),
+    # --- CSS para el estilo y posición del header ---
+    ui.tags.style("""
+        .dashboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+            padding: 0px;
         }
-        .nav.nav-tabs .nav-link {
-          width: 100%;
-          text-align: center;
-          font-weight: 600;
-          font-size: 13px;
-          line-height: 1.15;
-          white-space: normal;
-          height: 2.7em;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: #4B4B4B;
-          padding: 8px 6px;
+
+        .dashboard-title {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #2E2E2E;
+            font-family: 'Montserrat', sans-serif;
         }
-        .nav.nav-tabs .nav-link.active {
-          color: #E41E26 !important;
-          border-color: #E41E26 #E41E26 #fff !important;
+
+        .dashboard-logo {
+            height: 170px;
+            object-fit: contain;
         }
     """),
 
-    ui.h2("Monitor de Elasticidad de Precio"),
+    # --- Encabezado principal ---
+    ui.div(
+        {"class": "dashboard-header"},
+        ui.h1("Monitor de Elasticidad de Precio", class_="dashboard-title"),
+        ui.img(src="logo.png", class_="dashboard-logo")
+    ),
 
     ui.page_sidebar(
         ui.sidebar(
@@ -473,24 +661,67 @@ app_ui = ui.page_fluid(
             ui.output_ui("marca_sel_ui"),
             ui.output_ui("sku_sel_ui"),
             ui.output_ui("date_range_ui"),
-            width=200
+            width=200,
+            class_="sidebar-scroll"
         ),
 
         ui.navset_tab(
             # ---- NUEVA pestaña unificada: Sensibilidad de Precio y Volumen
             ui.nav_panel(
                 ui.tags.span("Sensibilidad de", ui.br(), "Precio y Volumen"),
+                
+                # === CONTENEDOR PRINCIPAL CON MARGENES ===
                 ui.div(
-                    ui.row(
-                        ui.column(3, ui.output_ui("kpi_sens_ppg")),
-                        ui.column(3, ui.output_ui("kpi_sens_vtm")),
-                        ui.column(3, ui.output_ui("kpi_sens_net")),
-                        ui.column(3, ui.output_ui("kpi_sens_dir")),
+                    # --- KPIs Superiores ---
+                    ui.div(
+                        ui.row(
+                            ui.column(3, ui.output_ui("kpi_riesgo_externo")),
+                            ui.column(3, ui.output_ui("kpi_demanda_perdida")),
+                            ui.column(3, ui.output_ui("kpi_canibal_total")),
+                            ui.column(3, ui.output_ui("kpi_indice_riesgo_global")),
+                        ),
+                        style=(
+                            "margin-top: 25px; "
+                            "margin-bottom: 35px; "
+                            "padding-top: 15px; "
+                            "padding-bottom: 15px; "
+                            "border-top: 2px solid #E9ECEF; "
+                            "border-bottom: 2px solid #E9ECEF;"
+                        )
                     ),
-                    style="margin-top:16px; margin-bottom:10px;"
-                ),
-                ui.output_data_frame("tabla_sensibilidad"),
-                ui.download_button("dl_sensibilidad", "Descargar análisis (CSV)")
+
+                    # --- Tabla de sensibilidad ---
+                    ui.div(
+                        ui.h5("Análisis de Sensibilidad de Precio y Volumen", 
+                            style="text-align:center; font-weight:600; margin-bottom:20px; color:#4B4B4B;"),
+                        ui.output_data_frame("tabla_sensibilidad"),
+                        style=(
+                            "max-width: 90%; "
+                            "margin: 0 auto; "
+                            "margin-top: 10px; "
+                            "margin-bottom: 40px;"
+                        )
+                    ),
+
+                    # --- Diagrama Sankey ---
+                    ui.div(
+                        ui.h5("Flujos de Volumen", 
+                            style="text-align:center; font-weight:600; margin-bottom:15px; color:#4B4B4B;"),
+                        output_widget("fig_sankey"),
+                        style=(
+                            "max-width: 90%; "
+                            "margin: 0 auto; "
+                            "margin-top: 40px; "
+                            "margin-bottom: 60px;"
+                        )
+                    ),
+
+                    # --- Botón de descarga centrado ---
+                    ui.div(
+                        ui.download_button("dl_sensibilidad", "Descargar análisis (CSV)"),
+                        style="text-align:center; margin-top:20px; margin-bottom:40px;"
+                    ),
+                )
             ),
 
             # ---- Línea de tiempo
@@ -498,11 +729,12 @@ app_ui = ui.page_fluid(
                 ui.tags.span("Línea de tiempo", ui.br(), "de Elasticidad"),
                 ui.div(
                     ui.row(
-                        ui.column(4, ui.output_ui("kpi_1")),
-                        ui.column(4, ui.output_ui("kpi_2")),
-                        ui.column(4, ui.output_ui("kpi_3")),
+                        ui.column(3, ui.output_ui("kpi_1")),
+                        ui.column(3, ui.output_ui("kpi_4")), 
+                        ui.column(3, ui.output_ui("kpi_2")),
+                        ui.column(3, ui.output_ui("kpi_3")),
                     ),
-                    style="margin-top:16px; margin-bottom:10px;"
+                    style="display:flex; justify-content:center; align-items:stretch; gap:10px; margin:10px 0;"
                 ),
                 ui.input_radio_buttons(
                     "modo_eps", "Serie mostrada",
@@ -514,10 +746,42 @@ app_ui = ui.page_fluid(
             ),
             ui.nav_panel(
                 ui.tags.span("Clasificación", ui.br(), "de Elasticidad"),
-                output_widget("fig_mapa"),
-                output_widget("fig_pie"),
-                ui.download_button("dl_mapa", "Descargar mapa de elasticidad (CSV)")
+
+                # === CONTENEDOR FLEX PADRE ===
+                ui.div(
+                    {"class": "fila-graficos"},
+                    ui.div(
+                        {"class": "grafico-izquierdo"},
+                        output_widget("fig_mapa")
+                    ),
+                    ui.div(
+                        {"class": "grafico-derecho"},
+                        output_widget("fig_pie")
+                    ),
+                    ui.div(
+                        {"class": "bloque-elasticidad"},
+                        ui.HTML("""
+                        <p style="font-size:15px; color:#2E2E2E; margin-bottom:6px;">
+                            <b>Interpretación general de elasticidad de precios</b>
+                        </p>
+                        <p style="font-size:13px; color:#4B4B4B; line-height:1.5;">
+                            <span style="color:#E41E26; font-weight:600;">Elástico (&gt;1):</span> 
+                            Demanda altamente sensible al precio.<br>
+                            <span style="color:#4B4B4B; font-weight:600;">Inelástico (&lt;1):</span> 
+                            Demanda estable con respecto al precio.<br>
+                            <span style="color:#000000; font-weight:600;">Unitario (=1):</span> 
+                            Relación proporcional entre precio y volumen.
+                        </p>
+                        """)
+                    ),
+                ),
+
+                ui.div(
+                    ui.download_button("dl_mapa", "Descargar mapa de elasticidad (CSV)"),
+                    style="text-align:center; margin-top:10px;"
+                )
             ),
+
             ui.nav_panel(
                 ui.tags.span("Explorador de", ui.br(), "Ventas"),
                 ui.input_radio_buttons(
@@ -682,7 +946,9 @@ def server(input, output, session):
             return {"last": d_last, "weights": w, "joined": pd.DataFrame()}
 
         mt2 = mt.dropna(subset=["SKU"]).copy()
-        j = mt2.merge(w, on="SKU", how="left")
+        mt2["SKU_KEY"] = _norm_series(mt2["SKU"])
+        w["SKU_KEY"] = _norm_series(w["SKU"])
+        j = mt2.merge(w[["SKU_KEY", "W_CU"]], on="SKU_KEY", how="left")
         j["W_CU"] = pd.to_numeric(j["W_CU"], errors="coerce").fillna(0.0)
 
         # ===== Normaliza claves para comparaciones robustas
@@ -743,101 +1009,230 @@ def server(input, output, session):
         if not mask.any():
             return np.nan
         return float(np.average(vv[mask], weights=ww[mask]))
+    
+    def vtm_percentages_from_mapping(df_map: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calcula para cada SKU origen (SOURCE_SKU) los porcentajes de volumen transferido
+        hacia productos internos (Coca-Cola), hacia competencia y la demanda perdida.
+        """
+        d = df_map.copy()
+        if d.empty:
+            return pd.DataFrame(columns=[
+                "SOURCE_SKU_KEY", "Pct_interno", "Pct_competencia", "Pct_demanda_perdida"
+            ])
+        
+        # --- Normalizar columnas clave ---
+        for col in ["SOURCE_SKU", "DESTINATION_SKU", "SRC_MFG", "DEST_MFG"]:
+            if col not in d.columns:
+                raise KeyError(f"Falta la columna requerida: {col}")
+        d["SOURCE_SKU_KEY"] = _norm_series(d["SOURCE_SKU"])
+        d["DEST_SKU_KEY"] = _norm_series(d["DESTINATION_SKU"])
+        d["SRC_MFG_KEY"] = _norm_series(d["SRC_MFG"])
+        d["DEST_MFG_KEY"] = _norm_series(d["DEST_MFG"])
+
+        # --- Identificar tipo de flujo ---
+        d["IS_SRC_COCA"] = d["SRC_MFG_KEY"].str.contains("COCA", na=False)
+        d["IS_DEST_COCA"] = d["DEST_MFG_KEY"].str.contains("COCA", na=False)
+        d["VOLUME_TRANSFER"] = pd.to_numeric(d["VOLUME_TRANSFER"], errors="coerce").fillna(0)
+
+        # --- Agregaciones por SKU origen ---
+        agg = (
+            d[d["IS_SRC_COCA"]]  # solo fuentes Coca-Cola
+            .groupby("SOURCE_SKU_KEY", dropna=False)
+            .apply(lambda g: pd.Series({
+                "Vol_total": g["VOLUME_TRANSFER"].sum(),
+                "Vol_interno": g.loc[g["IS_DEST_COCA"], "VOLUME_TRANSFER"].sum(),
+                "Vol_competencia": g.loc[~g["IS_DEST_COCA"], "VOLUME_TRANSFER"].sum()
+            }))
+            .reset_index()
+        )
+
+        # --- Calcular proporciones ---
+        agg["Vol_total"] = agg["Vol_total"].replace(0, np.nan)
+        agg["Pct_interno"] = (agg["Vol_interno"] / agg["Vol_total"]).clip(0, 1)
+        agg["Pct_competencia"] = (agg["Vol_competencia"] / agg["Vol_total"]).clip(0, 1)
+        agg["Pct_demanda_perdida"] = (1 - (agg["Pct_interno"] + agg["Pct_competencia"])).clip(0, 1)
+
+        return agg[[
+            "SOURCE_SKU_KEY", "Pct_interno", "Pct_competencia", "Pct_demanda_perdida"
+        ]]
+
 
     # ================= NUEVA TAB: Sensibilidad dinámica por nivel =================
     @reactive.Calc
     def sensibilidad_nivel_tabla_df():
-        """
-        Genera la tabla de sensibilidad jerárquica filtrada dinámicamente
-        según los selectores activos (Categoría → Subcategoría → Marca → SKU)
-        y ponderada por el volumen (W_CU).
-        """
         try:
-            ctx = vtm_context()
-            j = ctx["joined"].copy()
-            if j.empty:
+            vm = df_vtm_map().copy()
+            mt = df_mt_pe().copy()
+
+            if vm.empty:
+                print("⚠️ df_vtm_map vacío.")
                 return pd.DataFrame()
 
-            # ----------------------------
-            #  Aplicar filtros jerárquicos
-            # ----------------------------
-            f = filters()
-            if f["cat"] != "All" and "CATEGORIA" in j.columns:
-                cat_clean = f["cat"].strip().upper()
-                j["CATEGORIA_NORM"] = j["CATEGORIA"].astype(str).str.strip().str.upper()
-                j = j[j["CATEGORIA_NORM"] == cat_clean]
-            if f["sub"] != "All" and "SUBCATEGORIA" in j.columns:
-                j = j[j["SUBCATEGORIA"] == f["sub"]]
-            if f["marca"] != "All" and "MARCA" in j.columns:
-                j = j[j["MARCA"] == f["marca"]]
-            if f["sku"] != "All" and "SKU" in j.columns:
-                j = j[j["SKU"] == f["sku"]]
-
-            if j.empty:
+            # --- Filtrar solo SKUs Coca-Cola (fabricante origen)
+            vm["SRC_MFG_KEY"] = _norm_series(vm.get("SRC_MFG", pd.Series(index=vm.index, dtype=str)))
+            mask_coca = vm["SRC_MFG_KEY"].str.contains("COCA COLA FABRICANTE", na=False)
+            vm = vm[mask_coca].copy()
+            if vm.empty:
+                print("⚠️ No hay flujos con fabricante COCA.")
                 return pd.DataFrame()
 
-            # ----------------------------
-            # Determinar nivel actual
-            # ----------------------------
-            lvl = level_sel()
-            level_col = (
-                "CATEGORIA" if lvl == "Total"
-                else "SUBCATEGORIA" if lvl == "Categoría"
-                else "MARCA" if lvl == "Subcategoría"
-                else "SKU"
-            )
+            # --- Limpieza básica
+            vm["VOLUME_TRANSFER"] = pd.to_numeric(vm["VOLUME_TRANSFER"], errors="coerce").fillna(0)
+            vm = vm[vm["VOLUME_TRANSFER"] > 0].copy()
 
-            # ----------------------------
-            # Calcular agregados ponderados
-            # ----------------------------
-            j["W_CU"] = pd.to_numeric(j["W_CU"], errors="coerce").fillna(0)
-            j["PPG_PE"] = pd.to_numeric(j["PPG_PE"], errors="coerce")
-            j["NET_PE"] = pd.to_numeric(j["NET_PE"], errors="coerce")
-            j["VTM_RATIO"] = pd.to_numeric(j["VTM_RATIO"], errors="coerce")
+            # --- Claves normalizadas
+            vm["SOURCE_SKU_KEY"] = _norm_series(vm["SOURCE_SKU"])
+            vm["DEST_MFG_KEY"] = _norm_series(vm["DEST_MFG"])
+            vm["IS_DEST_COCA"] = vm["DEST_MFG_KEY"].str.contains("COCA", na=False)
 
-            def safe_avg(values, weights):
-                v = pd.to_numeric(values, errors="coerce")
-                w = pd.to_numeric(weights, errors="coerce").clip(lower=0)
-                mask = v.notna() & w.notna() & (w > 0)
-                if not mask.any() or w[mask].sum() == 0:
-                    return np.nan
-                return float(np.average(v[mask], weights=w[mask]))
-
-            df = (
-                j.groupby(level_col, dropna=False)
-                .apply(lambda g: pd.Series({
-                    "W_CU_TOT": g["W_CU"].sum(),
-                    "Elasticidad_bruta": safe_avg(g["PPG_PE"], g["W_CU"]),
-                    "Elasticidad_neta": safe_avg(g["NET_PE"], g["W_CU"]),
-                    "VTM_Ratio": safe_avg(g["VTM_RATIO"], g["W_CU"]),
+            # --- Agregación base por SKU
+            g = (
+                vm.groupby("SOURCE_SKU_KEY", dropna=False)
+                .apply(lambda s: pd.Series({
+                    "vol_int": s.loc[s["IS_DEST_COCA"], "VOLUME_TRANSFER"].sum(),
+                    "vol_comp": s.loc[~s["IS_DEST_COCA"], "VOLUME_TRANSFER"].sum(),
+                    "cat": s["CATEGORIA"].iloc[0] if "CATEGORIA" in s.columns else "Desconocido",
+                    "subcat": s["SUBCATEGORIA"].iloc[0] if "SUBCATEGORIA" in s.columns else "Desconocido",
+                    "marca": s["MARCA"].iloc[0],   # ✅ usar la marca derivada
+                    "sku": s["SOURCE_SKU"].iloc[0],
                 }))
                 .reset_index()
             )
 
-            # ----------------------------
-            # Cálculos derivados
-            # ----------------------------
-            df["Elasticidad_gap"] = df["Elasticidad_bruta"] - df["Elasticidad_neta"]
-            df["Sensibilidad"] = np.where(df["Elasticidad_neta"].abs() > 1, "Alta", "Baja")
-            df["Riesgo_VTM"] = np.where(df["VTM_Ratio"] > 0.5, "Competencia", "Interna")
+            g["vol_map"] = g["vol_int"] + g["vol_comp"]
+            g = g[g["vol_map"] > 0].copy()
+            if g.empty:
+                print("⚠️ No hay SKUs con volumen mapeado válido.")
+                return pd.DataFrame()
 
-            def clasificar_fila(row):
-                if pd.isna(row["Elasticidad_neta"]):
-                    return "Sin dato"
-                if row["Sensibilidad"] == "Alta" and row["Riesgo_VTM"] == "Competencia":
-                    return "🔴 Crítico: pérdida externa"
-                elif row["Sensibilidad"] == "Alta" and row["Riesgo_VTM"] == "Interna":
-                    return "🟠 Canibalización interna"
-                elif row["Sensibilidad"] == "Baja" and row["Riesgo_VTM"] == "Competencia":
-                    return "🟡 Estable, pero vigilado"
-                elif row["Sensibilidad"] == "Baja" and row["Riesgo_VTM"] == "Interna":
-                    return "🟢 Portafolio sólido"
-                else:
-                    return "Sin dato"
+            # --- Porcentajes
+            g["pct_int"] = (g["vol_int"] / g["vol_map"]) * 100
+            g["pct_comp"] = (g["vol_comp"] / g["vol_map"]) * 100
+            g["pct_loss"] = (100 - (g["pct_int"] + g["pct_comp"])).clip(lower=0)
 
-            df["Clasificacion"] = df.apply(clasificar_fila, axis=1)
-            df = df.rename(columns={level_col: "Entidad"})
-            return df
+            # --- Merge con elasticidades
+            mt["SKU_KEY"] = _norm_series(mt["SKU"])
+            g = g.merge(
+                mt[["SKU_KEY", "PPG_PE", "NET_PE", "SUBCATEGORIA", "CATEGORIA"]],
+                left_on="SOURCE_SKU_KEY", right_on="SKU_KEY", how="left"
+            )
+
+            # --- Filtros jerárquicos reales
+            f = filters()
+
+            if f["cat"] != "All" and "CATEGORIA" in g.columns:
+                g = g[_norm_series(g["CATEGORIA"]) == _norm_val(f["cat"])]
+
+            if f["sub"] != "All" and "SUBCATEGORIA" in g.columns:
+                g = g[_norm_series(g["SUBCATEGORIA"]) == _norm_val(f["sub"])]
+
+            if f["marca"] != "All" and "marca" in g.columns:
+                marca_filtro = _norm_val(f["marca"]).replace("-", " ")
+                g = g[_norm_series(g["marca"]).str.replace("-", " ") == marca_filtro]
+
+            if f["sku"] != "All" and "sku" in g.columns:
+                g = g[_norm_series(g["sku"]) == _norm_val(f["sku"])]
+
+            if g.empty:
+                print("⚠️ No hay datos después de aplicar filtros.")
+                return pd.DataFrame()
+
+            # --- Nivel jerárquico dinámico (drilldown)
+            if f["sku"] != "All":
+                level_col = "sku"
+            elif f["marca"] != "All":
+                level_col = "sku"
+            elif f["sub"] != "All":
+                level_col = "marca"
+            elif f["cat"] != "All":
+                level_col = "subcat"
+            else:
+                level_col = "cat"
+
+            print(f"[DEBUG] Nivel detectado: {level_col}, Registros: {len(g)}")
+
+            # --- Agregación ponderada
+            def wavg(v, w):
+                v = pd.to_numeric(v, errors="coerce")
+                w = pd.to_numeric(w, errors="coerce")
+                m = v.notna() & w.notna() & (w > 0)
+                return float(np.average(v[m], weights=w[m])) if m.any() else np.nan
+
+            agg = (
+                g.groupby(level_col, dropna=False)
+                .apply(lambda d: pd.Series({
+                    "Elasticidad Bruta": wavg(d["PPG_PE"], d["vol_map"]),
+                    "Elasticidad Neta": wavg(d["NET_PE"], d["vol_map"]),
+                    "% Interno": wavg(d["pct_int"], d["vol_map"]),
+                    "% Competencia": wavg(d["pct_comp"], d["vol_map"]),
+                    "% Demanda Perdida": wavg(d["pct_loss"], d["vol_map"]),
+                }))
+                .reset_index()
+                .rename(columns={level_col: "Entidad"})
+            )
+
+            def clasificar(row):
+                pi, pc, pl = row["% Interno"], row["% Competencia"], row["% Demanda Perdida"]
+
+                # --- VALIDACIÓN BÁSICA ---
+                if any(pd.isna([pi, pc, pl])):
+                    return "⚪ Sin datos suficientes"
+
+                # --- ESCENARIOS DE PÉRDIDA EXTERNA (riesgo competitivo) ---
+                if pc >= 85:
+                    return "🔴 Pérdida externa crítica (>85%)"
+                elif 70 <= pc < 85:
+                    return "🟥 Pérdida externa alta (70–85%)"
+                elif 50 <= pc < 70:
+                    return "🟧 Pérdida competitiva relevante (50–70%)"
+                elif 35 <= pc < 50 and pi < 40:
+                    return "🟨 Riesgo competitivo moderado (35–50%)"
+
+                # --- ESCENARIOS DE DEMANDA PERDIDA (erosión estructural) ---
+                if pl >= 65:
+                    return "⚫ Demanda perdida crítica (>65%)"
+                elif 45 <= pl < 65:
+                    return "⚫ Demanda perdida alta (45–65%)"
+                elif 25 <= pl < 45:
+                    return "🟠 Demanda perdida moderada (25–45%)"
+                elif 10 <= pl < 25 and pi < 50 and pc < 50:
+                    return "🟤 Riesgo leve de erosión de demanda (10–25%)"
+
+                # --- ESCENARIOS INTERNOS (retención o canibalización) ---
+                if pi >= 95:
+                    return "🟢 Canibalización interna total (>95%)"
+                elif 85 <= pi < 95:
+                    return "🟩 Canibalización interna fuerte (85–95%)"
+                elif 70 <= pi < 85 and pc < 25:
+                    return "🟢 Retención interna dominante (70–85%)"
+                elif 50 <= pi < 70 and pc < 35:
+                    return "🟢 Retención interna moderada (50–70%)"
+                elif 30 <= pi < 50 and pc < 30 and pl < 30:
+                    return "🟢 Retención interna débil (30–50%)"
+
+                # --- ESCENARIOS MIXTOS (flujo combinado) ---
+                if 40 <= pi < 80 and 20 <= pc < 60:
+                    return "🟡 Flujo mixto interno–competencia (ambos >20%)"
+                elif 30 <= pi < 60 and 15 <= pl < 40:
+                    return "🟤 Flujo mixto interno–demanda perdida"
+                elif 30 <= pc < 60 and 15 <= pl < 40:
+                    return "🟣 Flujo mixto competencia–demanda perdida"
+
+                # --- ESCENARIO ESTABLE ---
+                if pi < 30 and pc < 30 and pl < 20:
+                    return "⚪ Estable sin movimientos relevantes"
+
+                return "⚪ Indeterminado"
+
+            agg["Clasificación estratégica"] = agg.apply(clasificar, axis=1)
+            agg = agg.round(2)
+
+            return agg[[
+                "Entidad", "Elasticidad Bruta", "Elasticidad Neta",
+                "% Interno", "% Competencia", "% Demanda Perdida",
+                "Clasificación estratégica"
+            ]]
 
         except Exception as e:
             print("Error en sensibilidad_nivel_tabla_df:", e)
@@ -845,74 +1240,249 @@ def server(input, output, session):
 
 
     # ----------------------------
-    # Render de tabla (usa la nueva función)
+    # Render de tabla
     # ----------------------------
     @render.data_frame
     def tabla_sensibilidad():
+        """
+        Tabla dinámica de Sensibilidad de Precio y Volumen.
+        Adapta las columnas dinámicamente según el nivel detectado.
+        """
         df = sensibilidad_nivel_tabla_df().copy()
-        if df.empty:
-            return pd.DataFrame(columns=["Entidad", "Elasticidad_bruta", "Elasticidad_neta", "VTM_Ratio", "Clasificacion"])
 
-        df["Elasticidad_bruta"] = df["Elasticidad_bruta"].round(2)
-        df["Elasticidad_neta"] = df["Elasticidad_neta"].round(2)
-        df["Elasticidad_gap"] = df["Elasticidad_gap"].round(2)
-        df["VTM_Ratio"] = (df["VTM_Ratio"] * 100).round(1)
+        if df.empty or "Entidad" not in df.columns:
+            print("⚠️ No se encontraron datos para los filtros actuales.")
+            return pd.DataFrame(columns=[
+                "Nombre", "Elasticidad Bruta", "Elasticidad Neta",
+                "% Interno", "% Competencia", "% Demanda Perdida",
+                "Clasificación estratégica"
+            ])
 
-        df = df.rename(columns={
-            "Entidad": "Nombre",
-            "W_CU_TOT": "Volumen ponderado (CU)",
-            "Elasticidad_bruta": "Elasticidad Bruta",
-            "Elasticidad_neta": "Elasticidad Neta",
-            "Elasticidad_gap": "Δε (Gap)",
-            "VTM_Ratio": "VTM (%)",
-            "Riesgo_VTM": "Dirección Flujo",
-            "Sensibilidad": "Sensibilidad",
-            "Clasificacion": "Clasificación estratégica"
-        })
+        # Renombrar para visualización
+        df = df.rename(columns={"Entidad": "Nombre"})
 
+        # Forzar numéricos
+        for col in ["Elasticidad Bruta", "Elasticidad Neta", "% Interno", "% Competencia", "% Demanda Perdida"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+
+        # Si hay menos columnas, completar
+        for col in ["% Interno", "% Competencia", "% Demanda Perdida"]:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Reordenar columnas presentes
         cols = [
-            "Nombre", "Volumen ponderado (CU)", "Elasticidad Bruta", "Elasticidad Neta",
-            "Δε (Gap)", "VTM (%)", "Dirección Flujo", "Sensibilidad", "Clasificación estratégica"
+            "Nombre", "Elasticidad Bruta", "Elasticidad Neta",
+            "% Interno", "% Competencia", "% Demanda Perdida",
+            "Clasificación estratégica"
         ]
-        return df[cols]
+        df = df[[c for c in cols if c in df.columns]]
+
+        # Si sigue vacío, mostrar aviso
+        if df.empty:
+            print("⚠️ sensibilidad_nivel_tabla_df devolvió datos vacíos tras filtrado.")
+        return df
+    
+    @render_widget
+    def fig_sankey():
+        """
+        Muestra un diagrama Sankey dinámico basado en el nivel seleccionado (cat/sub/marca).
+        - Origen: entidad actual (ej. Agua con gas)
+        - Destino: fabricante destino (COCA, PEPSICO, BONAFONT, etc.)
+        - Valor: número de SKUs destino únicos con VOLUME_TRANSFER > 0
+        """
+        import plotly.graph_objects as go
+        import re
+
+        vm = df_vtm_map().copy()
+        f = filters()
+
+        # --- Filtrar solo Coca-Cola fabricante origen ---
+        vm["SRC_MFG_KEY"] = _norm_series(vm.get("SRC_MFG", pd.Series(index=vm.index, dtype=str)))
+        vm = vm[vm["SRC_MFG_KEY"].str.contains("COCA COLA FABRICANTE", na=False)]
+        if vm.empty:
+            return go.Figure()
+
+        # --- Limpiar y filtrar por volumen positivo ---
+        vm["VOLUME_TRANSFER"] = pd.to_numeric(vm["VOLUME_TRANSFER"], errors="coerce").fillna(0)
+        vm = vm[vm["VOLUME_TRANSFER"] > 0].copy()
+        if vm.empty:
+            return go.Figure()
+
+        # --- Limpieza robusta de textos ---
+        def clean_text(s):
+            if not isinstance(s, str):
+                return ""
+            s = s.upper().strip()
+            s = re.sub(r"[^A-Z0-9ÁÉÍÓÚÑ ]+", " ", s)   # solo letras/números
+            s = re.sub(r"\s+", " ", s)                 # quitar dobles espacios
+            return s.strip()
+
+        for col in ["CATEGORIA", "SUBCATEGORIA", "MARCA", "DEST_MFG", "DESTINATION_SKU"]:
+            if col in vm.columns:
+                vm[col] = vm[col].astype(str).apply(clean_text)
+
+        # --- Aplicar filtros jerárquicos ---
+        if f["cat"] != "All" and "CATEGORIA" in vm.columns:
+            vm = vm[_norm_series(vm["CATEGORIA"]) == _norm_val(f["cat"])]
+        if f["sub"] != "All" and "SUBCATEGORIA" in vm.columns:
+            vm = vm[_norm_series(vm["SUBCATEGORIA"]) == _norm_val(f["sub"])]
+        if f["marca"] != "All" and "MARCA" in vm.columns:
+            vm = vm[_norm_series(vm["MARCA"]) == _norm_val(f["marca"])]
+
+        if vm.empty:
+            return go.Figure()
+
+        # --- Normalización de columnas destino ---
+        vm["DEST_MFG_CLEAN"] = vm["DEST_MFG"].fillna("DESCONOCIDO").apply(clean_text)
+        vm["DESTINATION_SKU"] = vm["DESTINATION_SKU"].astype(str).apply(clean_text)
+
+        # Agrupar por fabricante destino y SKU origen únicos
+        df_links = (
+            vm.groupby(["DEST_MFG_CLEAN", "SOURCE_SKU"], dropna=False)
+            .size()
+            .reset_index()
+            .groupby("DEST_MFG_CLEAN")["SOURCE_SKU"]
+            .nunique()
+            .reset_index()
+            .rename(columns={"SOURCE_SKU": "NUM_SKUS_ORIGEN"})
+        )
+
+        # --- Construcción del título jerárquico dinámico ---
+        jerarquia = []
+        if f["cat"] != "All": jerarquia.append(f["cat"])
+        if f["sub"] != "All": jerarquia.append(f["sub"])
+        if f["marca"] != "All": jerarquia.append(f["marca"])
+        origen = " → ".join(jerarquia) if jerarquia else "COCA-COLA FABRICANTE"
+
+        df_links["source"] = origen
+        df_links["target"] = df_links["DEST_MFG_CLEAN"]
+        df_links["value"] = df_links["NUM_SKUS_ORIGEN"]
+
+        # --- Crear lista de nodos únicos ---
+        labels = pd.unique(df_links[["source", "target"]].values.ravel("K")).tolist()
+        label_to_id = {label: i for i, label in enumerate(labels)}
+        df_links["source_id"] = df_links["source"].map(label_to_id)
+        df_links["target_id"] = df_links["target"].map(label_to_id)
+
+        # --- Ajuste de altura dinámico según cantidad de flujos ---
+        altura_base = 450
+        extra = len(df_links) * 25 
+        altura_total = min(altura_base + extra, 1000)
+
+        # --- Crear gráfico Sankey ---
+        fig = go.Figure(data=[go.Sankey(
+            arrangement="snap",
+            node=dict(
+                pad=25,
+                thickness=20,
+                line=dict(color="black", width=0.3),
+                label=labels,
+                color=[
+                    "#E41E26" if "COCA" in lbl else "#4B4B4B"
+                    for lbl in labels
+                ]
+            ),
+            link=dict(
+                source=df_links["source_id"],
+                target=df_links["target_id"],
+                value=df_links["value"],
+                color=[
+                    "rgba(228,30,38,0.4)" if "COCA" in str(t)
+                    else "rgba(75,75,75,0.25)"
+                    for t in df_links["target"]
+                ],
+                hovertemplate="<b>%{source.label}</b> → <b>%{target.label}</b><br>"
+                            "SKUs Destino: %{value}<extra></extra>"
+            )
+        )])
+
+        # --- Layout estético ---
+        fig.update_layout(
+            title=dict(
+                text=f"{origen}",
+                x=0.5,
+                xanchor="center",
+                font=dict(size=16, family="Montserrat", color="#2E2E2E")
+            ),
+            height=altura_total,
+            margin=dict(l=50, r=50, t=80, b=40),
+            font=dict(size=13),
+            plot_bgcolor="white",
+            paper_bgcolor="white"
+        )
+
+        return fig
 
 
 
     @render.download(filename="sensibilidad_precio_volumen.csv")
     def dl_sensibilidad():
-        df = sensibilidad_nivel_df().copy()
+        df = sensibilidad_nivel_tabla_df().copy()
         if df.empty:
             yield b""
         else:
             yield df.to_csv(index=False).encode("utf-8")
 
-    # KPIs (arriba del gráfico de sensibilidad)
+    # KPIs Riesgo Estratégico Agregado Sensibilidad Precio y volumen
     @render.ui
-    def kpi_sens_ppg():
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "PPG_PE", filters())
-        return kpi_card("Elasticidad Bruta (PPG_PE)", f"{val:.2f}" if pd.notna(val) else "—")
+    def kpi_riesgo_externo():
+        df = sensibilidad_nivel_tabla_df().copy()
+        if df.empty or "% Competencia" not in df.columns:
+            return kpi_card("% SKUs con pérdida externa (>50%)", "—")
+
+        val = (df["% Competencia"] >= 50).mean() * 100
+        color = "#E41E26" if val > 20 else "#2ECC71"
+        return kpi_card(
+            "% SKUs con pérdida externa (>50%)",
+            ui.HTML(f"<span style='color:{color}'>{val:.1f}%</span>")
+        )
 
     @render.ui
-    def kpi_sens_vtm():
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "VTM_RATIO", filters())
-        return kpi_card("VTM Ratio promedio", f"{val:.2f}" if pd.notna(val) else "—")
+    def kpi_demanda_perdida():
+        df = sensibilidad_nivel_tabla_df().copy()
+        if df.empty or "% Demanda Perdida" not in df.columns:
+            return kpi_card("% SKUs con demanda perdida (>30%)", "—")
+
+        val = (df["% Demanda Perdida"] >= 30).mean() * 100
+        color = "#E67E22" if val > 10 else "#2ECC71"
+        return kpi_card(
+            "% SKUs con demanda perdida (>30%)",
+            ui.HTML(f"<span style='color:{color}'>{val:.1f}%</span>")
+        )
+
 
     @render.ui
-    def kpi_sens_net():
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "NET_PE", filters())
-        return kpi_card("Elasticidad Neta (NET_PE)", f"{val:.2f}" if pd.notna(val) else "—")
+    def kpi_canibal_total():
+        df = sensibilidad_nivel_tabla_df().copy()
+        if df.empty or "% Interno" not in df.columns:
+            return kpi_card("% SKUs con canibalización interna total (>90%)", "—")
+
+        val = (df["% Interno"] >= 90).mean() * 100
+        color = "#F1C40F" if val > 30 else "#2ECC71"
+        return kpi_card(
+            "% SKUs con canibalización interna total (>90%)",
+            ui.HTML(f"<span style='color:{color}'>{val:.1f}%</span>")
+        )
 
     @render.ui
-    def kpi_sens_dir():
-        j = vtm_context()["joined"]
-        val = _wavg_metric_at_level(j, "VTM_RATIO", filters())
-        estado = "Competencia" if (pd.notna(val) and val > 0.5) else "Interna"
-        color = "#E41E26" if estado=="Competencia" else "#2ECC71"
-        return kpi_card("Dirección de Volumen", ui.HTML(f"<span style='color:{color}'>{estado}</span>"))
+    def kpi_indice_riesgo_global():
+        df = sensibilidad_nivel_tabla_df().copy()
+        if df.empty or not set(["% Competencia", "% Demanda Perdida", "% Interno"]).issubset(df.columns):
+            return kpi_card("Índice de Riesgo Global (IRG)", "—")
 
+        val = (
+            0.5 * df["% Competencia"].mean() +
+            0.3 * df["% Demanda Perdida"].mean() -
+            0.2 * df["% Interno"].mean()
+        )
+        color = "#E41E26" if val > 0 else "#2ECC71"
+        return kpi_card(
+            "Índice de Riesgo Global (IRG)",
+            ui.HTML(f"<span style='color:{color}'>{val:.2f}</span>")
+        )
+    
     # ================= Línea de tiempo (ajustada para incluir 'Marca')
     @render.ui
     def kpi_1():
@@ -962,11 +1532,14 @@ def server(input, output, session):
         if j.empty: return kpi_card("NET_PE ponderada (neta)", "—")
         val = _wavg_metric_at_level(j, "NET_PE", filters())
         return kpi_card("NET_PE ponderada (neta)", f"{val:.4f}" if pd.notna(val) else "—")
-
-    @render_widget
-    def fig_linea():
+    
+    @render.ui
+    def kpi_4():
+        """Elasticidad promedio ponderada según el modo (Teórica / Ajustada)"""
         base = df_joined().copy()
         f = filters()
+
+        # Aplicar filtros activos
         if f['cat'] != "All" and "CATEGORIA" in base.columns: base = base[base["CATEGORIA"] == f['cat']]
         if f['sub'] != "All" and "SUBCATEGORIA" in base.columns: base = base[base["SUBCATEGORIA"] == f['sub']]
         if f['marca'] != "All" and "MARCA" in base.columns: base = base[base["MARCA"] == f['marca']]
@@ -974,24 +1547,74 @@ def server(input, output, session):
 
         win_start, win_end = last_full_year_window(df_base())
         base = base[(base["PERIOD"] >= win_start) & (base["PERIOD"] < win_end)].copy()
-        if base.empty: return go.Figure()
+        if base.empty:
+            return kpi_card("Elasticidad promedio ponderada", "—")
 
-        for c in ["dln_precio", "dln_cu", "FINAL_PE", "CU"]:
-            if c in base.columns:
-                base[c] = pd.to_numeric(base[c], errors="coerce")
-        base = base.sort_values(["SKU","PERIOD"]).copy()
-        base["CU_lag"] = base.groupby("SKU", sort=False)["CU"].shift(1)
-        base["PERIOD_M"] = pd.to_datetime(base["PERIOD"]).dt.to_period("M").dt.to_timestamp()
-
+        # Calcular ε según modo
         usar_ajustada = (input.modo_eps() == "Teórica Ajustada")
         if usar_ajustada:
-            work = apply_ranges_block(base.copy()); col_eps = "epsilon_used"; linea_label = "Elasticidad Teórica Ajustada"
+            work = apply_ranges_block(base.copy())
+            col_eps = "epsilon_used"
         else:
             if "epsilon_teor" not in base.columns:
                 dln_p = pd.to_numeric(base.get("dln_precio"), errors="coerce")
                 dln_q = pd.to_numeric(base.get("dln_cu"), errors="coerce")
                 base["epsilon_teor"] = (dln_q / dln_p).replace([np.inf, -np.inf], np.nan)
-            work = base.copy(); col_eps = "epsilon_teor"; linea_label = "Elasticidad Teórica"
+            work = base.copy()
+            col_eps = "epsilon_teor"
+
+        # Ponderación por volumen previo
+        work["CU_lag"] = work.groupby("SKU", sort=False)["CU"].shift(1)
+        w = pd.to_numeric(work["CU_lag"], errors="coerce").fillna(0)
+        v = pd.to_numeric(work[col_eps], errors="coerce")
+
+        mask = v.notna() & w.notna() & (w > 0)
+        if not mask.any():
+            return kpi_card("Elasticidad promedio ponderada", "—")
+
+        val = float(np.average(v[mask], weights=w[mask]))
+        estado = "Elástico" if abs(val) > 1 else "Inelástico"
+        color = COCA_RED if abs(val) > 1 else COCA_GRAY_DARK
+
+        etiqueta = f"{'Ajustada' if usar_ajustada else 'Teórica'} ({estado})"
+        return kpi_card(f"Elasticidad promedio ponderada", ui.HTML(f"<span style='color:{color}'>{val:.3f}</span><br><span class='muted'>{etiqueta}</span>"))
+
+
+    @render_widget
+    def fig_linea():
+        base = df_joined().copy()
+        f = filters()
+
+        # Aplicar filtros activos
+        if f['cat'] != "All" and "CATEGORIA" in base.columns: base = base[base["CATEGORIA"] == f['cat']]
+        if f['sub'] != "All" and "SUBCATEGORIA" in base.columns: base = base[base["SUBCATEGORIA"] == f['sub']]
+        if f['marca'] != "All" and "MARCA" in base.columns: base = base[base["MARCA"] == f['marca']]
+        if f['sku'] != "All" and "SKU" in base.columns: base = base[base["SKU"] == f['sku']]
+
+        # Últimos 24 meses
+        win_start, win_end = last_full_year_window(df_base())
+        base = base[(base["PERIOD"] >= win_start) & (base["PERIOD"] < win_end)].copy()
+        if base.empty: return go.Figure()
+
+        for c in ["dln_precio", "dln_cu", "FINAL_PE", "CU", "P1_MIN", "P1_MAX", "P2_MIN", "P2_MAX"]:
+            if c in base.columns:
+                base[c] = pd.to_numeric(base[c], errors="coerce")
+
+        base["CU_lag"] = base.groupby("SKU", sort=False)["CU"].shift(1)
+        base["PERIOD_M"] = pd.to_datetime(base["PERIOD"]).dt.to_period("M").dt.to_timestamp()
+
+        # Selección de modo
+        usar_ajustada = (input.modo_eps() == "Teórica Ajustada")
+        if usar_ajustada:
+            work = apply_ranges_block(base.copy())
+            col_eps = "epsilon_used"
+            linea_label = "Elasticidad Teórica Ajustada"
+        else:
+            base["epsilon_teor"] = (pd.to_numeric(base["dln_cu"], errors="coerce") /
+                                    pd.to_numeric(base["dln_precio"], errors="coerce")).replace([np.inf, -np.inf], np.nan)
+            work = base.copy()
+            col_eps = "epsilon_teor"
+            linea_label = "Elasticidad Teórica"
 
         entity_map = {"Total": None, "Categoría": "CATEGORIA", "Subcategoría": "SUBCATEGORIA", "Marca": "MARCA", "SKU": "SKU"}
         serie = monthly_eps_weighted(work, col_eps, entity_map.get(level_sel()))
@@ -1001,32 +1624,92 @@ def server(input, output, session):
         w_ppg = _wavg_metric_at_level(j, "PPG_PE", filters())
         w_net = _wavg_metric_at_level(j, "NET_PE", filters())
 
+        def wavg(df, col):
+            v = pd.to_numeric(df[col], errors="coerce")
+            w = pd.to_numeric(df.get("CU_lag", 0), errors="coerce").fillna(0)
+            mask = v.notna() & w.notna() & (w > 0)
+            return float(np.average(v[mask], weights=w[mask])) if mask.any() else np.nan
+
+        p1_min, p1_max = wavg(base, "P1_MIN"), wavg(base, "P1_MAX")
+        p2_min, p2_max = wavg(base, "P2_MIN"), wavg(base, "P2_MAX")
+
+        # === GRÁFICO
         serie["PERIOD_M"] = pd.to_datetime(serie["PERIOD_M"], errors="coerce")
         x_dates = serie["PERIOD_M"].dt.tz_localize(None).dt.to_pydatetime()
 
         fig = go.Figure()
+
+        # Línea principal
         fig.add_trace(go.Scatter(
             x=x_dates, y=serie["eps"],
-            mode="lines+markers", name=linea_label, line=dict(width=2, color=COCA_RED),
+            mode="lines+markers", name=linea_label,
+            line=dict(width=2, color=COCA_RED),
             hovertemplate="%{x|%b %Y}<br>ε: %{y:.4f}<extra></extra>"
         ))
-        if pd.notna(w_ppg):
-            fig.add_hline(y=w_ppg, line_width=2, line_dash="dot",
-                          annotation_text="PPG_PE (bruta)", annotation_position="top left")
-        if pd.notna(w_net):
-            fig.add_hline(y=w_net, line_width=2, line_dash="dash",
-                          annotation_text="NET_PE (neta)", annotation_position="bottom left")
 
-        fig.add_hline(y=0, line_width=1, line_dash="dot")
-        fig.update_xaxes(type="date", tickformat="%b %Y", dtick="M1")
+        # RANGOS SOMBREADOS
+        work = apply_ranges_block(base.copy())
+
+        # Detectar tipo de rango predominante (P1 o P2)
+        if "PE_RANGE_CHECK_OVERALL" in work.columns:
+            range_check = pd.to_numeric(work["PE_RANGE_CHECK_OVERALL"], errors="coerce")
+            rango_predominante = 1 if (range_check == 1).sum() >= (range_check == 2).sum() else 2
+        else:
+            rango_predominante = 1
+
+        # Seleccionar límites promedio ponderados del rango activo
+        def _safe_avg(col):
+            return pd.to_numeric(work[col], errors="coerce").mean(skipna=True)
+
+        if rango_predominante == 1:
+            rango_min, rango_max = _safe_avg("P1_MIN"), _safe_avg("P1_MAX")
+            label, color = "P1 Range", "rgba(255, 0, 0, 0.08)"
+        else:
+            rango_min, rango_max = _safe_avg("P2_MIN"), _safe_avg("P2_MAX")
+            label, color = "P2 Range", "rgba(0, 0, 0, 0.06)"
+
+        # Dibujar solo el rango activo
+        if not np.isnan(rango_min) and not np.isnan(rango_max):
+            fig.add_shape(
+                type="rect", xref="paper", yref="y",
+                x0=0, x1=1, y0=rango_min, y1=rango_max,
+                fillcolor=color, line=dict(width=0), layer="below"
+            )
+            fig.add_annotation(
+                text=f"{label}: {rango_min:.2f} → {rango_max:.2f}",
+                xref="paper", x=1.02, y=(rango_min + rango_max) / 2,
+                yref="y", showarrow=False,
+                font=dict(size=11, color="#4B4B4B")
+            )
+
+        # Líneas de referencia fuera del área
+        for y, text, dash in [
+            (w_ppg, "PPG_PE (bruta)", "dot"),
+            (w_net, "NET_PE (neta)", "dash")
+        ]:
+            if pd.notna(y):
+                fig.add_hline(
+                    y=y,
+                    line_width=2,
+                    line_dash=dash,
+                    annotation_text=text,
+                    annotation_position="right",  # <-- corregido
+                    annotation=dict(font=dict(size=11, color="#4B4B4B")),
+        )
+
+        fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="#AAAAAA")
+
         fig.update_layout(
             title=f"{linea_label} (último año) — Nivel: {level_sel()}",
             yaxis_title="Elasticidad",
-            hovermode="x unified", height=CHART_H,
-            margin=dict(l=10, r=10, t=30, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5)
+            hovermode="x unified",
+            height=CHART_H + 60,
+            margin=dict(l=20, r=120, t=40, b=30),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5),
+            plot_bgcolor="#FFFFFF",
         )
         return fig
+
 
     @render.download(
         filename=lambda: f"linea_tiempo_elasticidad_{'ajustada' if input.modo_eps()=='Teórica Ajustada' else 'teorica'}_{level_sel().lower()}.csv"
@@ -1078,61 +1761,234 @@ def server(input, output, session):
         if math.isclose(ae, 1.0, rel_tol=1e-3, abs_tol=1e-3): return "Unitario"
         return "Inelástico (<1)" if ae < 1 else "Elástico (>1)"
 
+    # --- Variable reactiva global para guardar el orden del eje Y ---
+    order_y_reactive = reactive.Value([])
+
+
     @render_widget
     def fig_mapa():
-        dj5 = df_joined().copy()
+        mt = df_mt_pe().copy()
+        if mt.empty:
+            return go.Figure()
+
         f = filters()
-        if f['cat']   != "All" and "CATEGORIA"    in dj5.columns: dj5 = dj5[dj5["CATEGORIA"] == f['cat']]
-        if f['sub']   != "All" and "SUBCATEGORIA" in dj5.columns: dj5 = dj5[dj5["SUBCATEGORIA"] == f['sub']]
-        if f['marca'] != "All" and "MARCA"        in dj5.columns: dj5 = dj5[dj5["MARCA"] == f['marca']]
-        dj5 = dj5[(dj5["PERIOD"] >= f['d_start']) & (dj5["PERIOD"] <= f['d_end'])]
-        if dj5.empty: return go.Figure()
-        for c in ["CU","FINAL_PE"]:
-            if c in dj5.columns: dj5[c] = pd.to_numeric(dj5[c], errors="coerce")
-        dj5 = dj5.sort_values(["SKU","PERIOD"]).copy()
-        dj5["CU_lag"] = dj5.groupby("SKU", sort=False)["CU"].shift(1)
+
+        # --- Aplicar filtros jerárquicos ---
+        for col, key in [("CATEGORIA", "cat"), ("SUBCATEGORIA", "sub"), ("MARCA", "marca"), ("SKU", "sku")]:
+            if f[key] != "All" and col in mt.columns:
+                mt = mt[_norm_series(mt[col]) == _norm_val(f[key])]
+        if mt.empty:
+            return go.Figure()
+
+        # --- Determinar nivel actual ---
         lvl = level_sel()
         if lvl == "Total":
-            entity_col = "CATEGORIA" if "CATEGORIA" in dj5.columns else "SKU";  nivel_txt = "Categoría" if entity_col == "CATEGORIA" else "SKU"
+            entity_col, nivel_txt = "CATEGORIA", "Categoría"
         elif lvl == "Categoría":
-            entity_col = "SUBCATEGORIA" if "SUBCATEGORIA" in dj5.columns else "SKU"; nivel_txt = "Subcategoría" if entity_col == "SUBCATEGORIA" else "SKU"
-        elif lvl == "Marca" and "MARCA" in dj5.columns:
-            entity_col = "SKU"; nivel_txt = "SKU"
+            entity_col, nivel_txt = "SUBCATEGORIA", "Subcategoría"
+        elif lvl == "Subcategoría":
+            entity_col, nivel_txt = "MARCA", "Marca"
         else:
-            entity_col = "SKU"; nivel_txt = "SKU"
-        if entity_col not in dj5.columns: return go.Figure()
-        agg_df = (dj5.groupby([entity_col], dropna=False).apply(lambda g: wavg_safe(g["FINAL_PE"], g["CU_lag"])).reset_index(name="Elasticidad_prom"))
+            entity_col, nivel_txt = "SKU", "SKU"
+
+        # --- Clasificación de elasticidad ---
+        def classify_elasticity(e):
+            if pd.isna(e):
+                return "Sin dato"
+            ae = abs(float(e))
+            if math.isclose(ae, 1.0, rel_tol=1e-3, abs_tol=1e-3):
+                return "Unitario"
+            return "Inelástico (<1)" if ae < 1 else "Elástico (>1)"
+
+        # --- Agregación dinámica ---
+        if entity_col != "SKU":
+            # niveles agregados: Categoría / Subcategoría / Marca
+            agg_df = (
+                mt.groupby(entity_col, dropna=False)
+                .agg(
+                    Elasticidad_prom=("NET_PE", "mean"),
+                    Elasticidad_bruta=("PPG_PE", "mean"),
+                    SKUs_total=("SKU", "nunique"),
+                    SKUs_elasticos=("NET_PE", lambda s: (abs(s) > 1).sum()),
+                    SKUs_inelasticos=("NET_PE", lambda s: (abs(s) < 1).sum())
+                )
+                .reset_index()
+            )
+        else:
+            # nivel SKU: solo métricas individuales
+            agg_df = (
+                mt.groupby(entity_col, dropna=False)
+                .agg(
+                    Elasticidad_prom=("NET_PE", "mean"),
+                    Elasticidad_bruta=("PPG_PE", "mean"),
+                )
+                .reset_index()
+            )
+
         agg_df["Clase"] = agg_df["Elasticidad_prom"].apply(classify_elasticity)
-        order_y = (agg_df[[entity_col, "Elasticidad_prom"]].sort_values("Elasticidad_prom", ascending=False)[entity_col].astype(str).tolist())
-        color_map = {"Elástico (>1)": COCA_RED, "Unitario": COCA_BLACK, "Inelástico (<1)": COCA_GRAY_DARK}
+
+        # --- Orden visual unificado ---
+        order_y = agg_df.sort_values("Elasticidad_prom", ascending=False)[entity_col].tolist()
+        order_y_reactive.set(order_y)
+
+        color_map = {
+            "Elástico (>1)": COCA_RED,
+            "Unitario": "#000000",
+            "Inelástico (<1)": COCA_GRAY_DARK,
+            "Sin dato": "#B3B3B3",
+        }
+
+        # --- Crear figura ---
         fig = go.Figure()
+
         for cls in ["Elástico (>1)", "Unitario", "Inelástico (<1)"]:
             sub = agg_df[agg_df["Clase"] == cls]
-            if sub.empty: continue
-            fig.add_trace(go.Bar(orientation="h", x=sub["Elasticidad_prom"], y=sub[entity_col].astype(str), name=cls, marker_color=color_map.get(cls, "#B3B3B3")))
-        fig.update_layout(title=f"Elasticidad promedio por {nivel_txt}", xaxis_title="Elasticidad (ε)", yaxis_title=nivel_txt,
-                          height=CHART_H, margin=dict(l=10, r=10, t=40, b=10), barmode="overlay",
-                          yaxis=dict(categoryorder="array", categoryarray=order_y), legend=dict(orientation="h"))
-        fig.add_vline(x=1, line_width=2, line_dash="dot", line_color="#999999")
+            if sub.empty:
+                continue
+
+            # Tooltip condicional según el nivel
+            if entity_col != "SKU":
+                hovertemplate = (
+                    "<b>%{y}</b><br>"
+                    "Elasticidad neta: %{x:.3f}<br>"
+                    "Elasticidad bruta: %{customdata[0]:.3f}<br>"
+                    "SKUs elásticos: %{customdata[1]}<br>"
+                    "SKUs inelásticos: %{customdata[2]}<br>"
+                    "Total de SKUs: %{customdata[3]}<extra></extra>"
+                )
+                customdata = np.stack([
+                    sub["Elasticidad_bruta"],
+                    sub.get("SKUs_elasticos", np.nan),
+                    sub.get("SKUs_inelasticos", np.nan),
+                    sub.get("SKUs_total", np.nan)
+                ], axis=-1)
+            else:
+                hovertemplate = (
+                    "<b>%{y}</b><br>"
+                    "Elasticidad neta (NET_PE): %{x:.3f}<br>"
+                    "Elasticidad bruta (PPG_PE): %{customdata[0]:.3f}<extra></extra>"
+                )
+                customdata = np.stack([
+                    sub["Elasticidad_bruta"]
+                ], axis=-1)
+
+            fig.add_trace(go.Bar(
+                orientation="h",
+                x=sub["Elasticidad_prom"],
+                y=sub[entity_col].astype(str),
+                name=cls,
+                marker_color=color_map.get(cls, "#B3B3B3"),
+                hovertemplate=hovertemplate,
+                customdata=customdata
+            ))
+
+        # --- Layout elegante ---
+        fig.update_layout(
+            title=dict(
+                text=f"<b>Elasticidad Promedio Neta por {nivel_txt}</b>",
+                x=0.47, xanchor="center",
+                font=dict(size=18, family="Arial", color="#2E2E2E")
+            ),
+            xaxis_title="Elasticidad (ε)",
+            yaxis_title=nivel_txt,
+            yaxis=dict(categoryorder="array", categoryarray=order_y, automargin=True),
+            height=450,
+            showlegend=False,
+            margin=dict(l=90, r=60, t=70, b=50),
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF"
+        )
+
+        # Línea de referencia (-1)
         fig.add_vline(x=-1, line_width=2, line_dash="dot", line_color="#999999")
+
+        # Ajuste dinámico del rango X
+        min_x = min(agg_df["Elasticidad_prom"].min() - 0.2, -2)
+        fig.update_xaxes(range=[min_x, 0])
+
         return fig
+
+
 
     @render_widget
     def fig_pie():
-        dj5 = df_joined().copy()
-        if dj5.empty: return go.Figure()
-        dj5["CU_lag"] = dj5.groupby("SKU", sort=False)["CU"].shift(1)
-        agg_df = (dj5.groupby(["SKU"], dropna=False).apply(lambda g: wavg_safe(g["FINAL_PE"], g["CU_lag"])).reset_index(name="Elasticidad_prom"))
-        def classify(e):
-            if pd.isna(e): return "Sin dato"
-            ae = abs(float(e))
-            if math.isclose(ae, 1.0, rel_tol=1e-3, abs_tol=1e-3): return "Unitario"
-            return "Inelástico (<1)" if ae < 1 else "Elástico (>1)"
-        agg_df["Clase"] = agg_df["Elasticidad_prom"].apply(classify)
-        dist = agg_df["Clase"].value_counts(dropna=False).rename_axis("Clase").reset_index(name="count")
-        color_map = {"Elástico (>1)": COCA_RED, "Unitario": COCA_BLACK, "Inelástico (<1)": COCA_GRAY_DARK, "Sin dato": "#B3B3B3"}
-        fig = px.pie(dist, values="count", names="Clase", title="Distribución de clases", color="Clase", color_discrete_map=color_map)
-        fig.update_layout(height=320, margin=dict(l=10,r=10,t=40,b=10))
+        mt = df_mt_pe().copy()
+        if mt.empty:
+            return go.Figure()
+
+        f = filters()
+        for col, key in [("CATEGORIA", "cat"), ("SUBCATEGORIA", "sub"), ("MARCA", "marca"), ("SKU", "sku")]:
+            if f[key] != "All" and col in mt.columns:
+                mt = mt[_norm_series(mt[col]) == _norm_val(f[key])]
+        if mt.empty or "NET_PE" not in mt.columns:
+            return go.Figure()
+
+        def clasificar(e):
+            e = pd.to_numeric(e, errors="coerce")
+            if pd.isna(e):
+                return "Sin dato"
+            if abs(e - 1) < 1e-3:
+                return "Unitario"
+            return "Elástico (>1)" if abs(e) > 1 else "Inelástico (<1)"
+
+        mt["Clase"] = mt["NET_PE"].apply(clasificar)
+
+        lvl = level_sel()
+        entity_col = (
+            "CATEGORIA" if lvl == "Total" else
+            "SUBCATEGORIA" if lvl == "Categoría" else
+            "MARCA" if lvl == "Subcategoría" else
+            "SKU"
+        )
+
+        dist = (
+            mt.groupby(entity_col)["Clase"]
+            .value_counts(normalize=True)
+            .rename("Porcentaje")
+            .mul(100)
+            .reset_index()
+        )
+
+        color_map = {
+            "Elástico (>1)": COCA_RED,
+            "Inelástico (<1)": COCA_GRAY_DARK,
+            "Unitario": "#000000",
+            "Sin dato": "#B3B3B3",
+        }
+
+        fig = px.bar(
+            dist,
+            x="Porcentaje",
+            y=entity_col,
+            color="Clase",
+            orientation="h",
+            color_discrete_map=color_map,
+            text=dist["Porcentaje"].map(lambda v: f"{v:.1f}%")
+        )
+
+        fig.update_traces(
+            textposition="inside",
+            insidetextanchor="middle",
+            hovertemplate="<b>%{y}</b><br>%{color}: %{x:.1f}%<extra></extra>"
+        )
+
+        order_y = order_y_reactive.get() or sorted(dist[entity_col].unique().tolist())
+
+        fig.update_layout(
+            title=dict(
+                text="<b>Distribución Elásticos e Inelásticos</b>",
+                x=0.47, xanchor="center",
+                font=dict(size=18, family="Arial", color="#2E2E2E")
+            ),
+            barmode="stack",
+            xaxis_title="Porcentaje de SKUs",
+            yaxis_title=None,
+            yaxis=dict(categoryorder="array", categoryarray=order_y),
+            height=450,
+            showlegend=False,
+            margin=dict(l=40, r=60, t=70, b=50),
+            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF"
+        )
         return fig
 
     @render.download(filename="mapa_elasticidad.csv")
@@ -1234,4 +2090,9 @@ def server(input, output, session):
         d = df_filtered().copy()
         yield d.to_csv(index=False).encode("utf-8")
 
-app = App(app_ui, server)
+# --- Inicialización con assets estáticos ---
+app = App(
+    app_ui,
+    server,
+    static_assets=os.path.join(os.path.dirname(__file__), "www")
+)
